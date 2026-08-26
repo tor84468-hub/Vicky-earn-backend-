@@ -31,3 +31,14 @@ backups/
 .DS_Store
 .vscode/
 .idea/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+
+# Local database
+*.db
+
+# Environment/secrets
+.env
