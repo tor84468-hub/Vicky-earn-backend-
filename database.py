@@ -8,9 +8,18 @@ DATABASE = os.path.join(
 
 
 def get_db():
-    connection = sqlite3.connect(DATABASE)
+    connection = sqlite3.connect(
+        DATABASE,
+        timeout=30,
+        check_same_thread=False
+    )
     connection.row_factory = sqlite3.Row
+
+    # Improve SQLite concurrency on Render.
+    connection.execute("PRAGMA busy_timeout = 30000")
+    connection.execute("PRAGMA journal_mode = WAL")
     connection.execute("PRAGMA foreign_keys = ON")
+
     return connection
 
 
