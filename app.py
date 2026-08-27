@@ -1725,7 +1725,62 @@ def ensure_admin_tables():
 
 ensure_admin_tables()
 
+
+def ensure_env_admin():
+    """
+    Create or update the deployed admin account from environment variables.
+    """
+    import os
+    from werkzeug.security import generate_password_hash
+
+    email = os.environ.get("ADMIN_EMAIL", "").strip().lower()
+    name = os.environ.get("ADMIN_NAME", "").strip()
+    password = os.environ.get("ADMIN_PASSWORD", "")
+
+    if not email or not name or not password:
+        app.logger.warning(
+            "ADMIN_EMAIL, ADMIN_NAME or ADMIN_PASSWORD is missing."
+        )
+        return
+
+    db = get_db()
+
+    try:
+        admin = db.execute(
+            "SELECT id FROM admins WHERE email = ?",
+            (email,)
+        ).fetchone()
+
+        password_hash = generate_password_hash(password)
+
+        if admin:
+            db.execute(
+                """
+                UPDATE admins
+                SET name = ?, password = ?
+                WHERE email = ?
+                """,
+                (name, password_hash, email)
+            )
+        else:
+            db.execute(
+                """
+                INSERT INTO admins (name, email, password)
+                VALUES (?, ?, ?)
+                """,
+                (name, email, password_hash)
+            )
+
+        db.commit()
+
+        app.logger.info("✅ Environment admin account ready.")
+
+    finally:
+        db.close()
+
+
 if __name__ == "__main__":
+    ensure_env_admin()
     print("Vicky Earn API starting...")
     app.run(
         host="0.0.0.0",
