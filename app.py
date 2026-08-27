@@ -7,7 +7,16 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from database import init_db, get_db, transaction, generate_account_id
 
 app = Flask(__name__)
-CORS(app)
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": "*"
+        }
+    },
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Admin-Token"]
+)
 
 init_db()
 
@@ -1233,6 +1242,387 @@ def update_profile(user_id):
         "success": True,
         "message": "Profile updated successfully",
         "user": dict(updated)
+    })
+
+
+
+# ============================================================
+# ADMIN DASHBOARD
+# ============================================================
+
+import secrets
+from functools import wraps
+
+def admin_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        auth = request.headers.get("Authorization", "")
+
+        if not auth.startswith("Bearer "):
+            return jsonify({
+                "success": False,
+                "message": "Admin authentication required"
+            }), 401
+
+        token = auth[7:].strip()
+
+        db = get_db()
+
+        try:
+            session = db.execute(
+                """
+                SELECT admin_id
+                FROM admin_sessions
+                WHERE token = ?
+                AND expires_at > CURRENT_TIMESTAMP
+                """,
+                (token,)
+            ).fetchone()
+        finally:
+            db.close()
+
+        if not session:
+            return jsonify({
+                "success": False,
+                "message": "Invalid or expired admin session"
+            }), 401
+
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
+@app.route("/api/admin/login", methods=["POST"])
+def admin_login():
+    data = request.get_json(silent=True) or {}
+
+    email = str(data.get("email", "")).strip().lower()
+    password = str(data.get("password", ""))
+
+    if not email or not password:
+        return jsonify({
+            "success": False,
+            "message": "Admin email and password are required"
+        }), 400
+
+    db = get_db()
+
+    try:
+        admin = db.execute(
+            """
+            SELECT id, name, email, password
+            FROM admins
+            WHERE email = ?
+            """,
+            (email,)
+        ).fetchone()
+
+        if not admin or not check_password_hash(
+            admin["password"],
+            password
+        ):
+            return jsonify({
+                "success": False,
+                "message": "Invalid admin email or password"
+            }), 401
+
+        token = secrets.token_urlsafe(48)
+
+        db.execute(
+            """
+            INSERT INTO admin_sessions
+            (admin_id, token, expires_at)
+            VALUES (?, ?, datetime('now', '+7 days'))
+            """,
+            (admin["id"], token)
+        )
+
+        db.execute(
+            """
+            INSERT INTO admin_audit_logs
+            (admin_id, action, description)
+            VALUES (?, ?, ?)
+            """,
+            (
+                admin["id"],
+                "login",
+                "Admin logged into dashboard"
+            )
+        )
+
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "Admin login successful",
+            "token": token,
+            "admin": {
+                "id": admin["id"],
+                "name": admin["name"],
+                "email": admin["email"]
+            }
+        })
+
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/logout", methods=["POST"])
+@admin_required
+def admin_logout():
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:].strip()
+
+    db = get_db()
+
+    try:
+        session = db.execute(
+            "SELECT admin_id FROM admin_sessions WHERE token = ?",
+            (token,)
+        ).fetchone()
+
+        if session:
+            db.execute(
+                "DELETE FROM admin_sessions WHERE token = ?",
+                (token,)
+            )
+
+            db.execute(
+                """
+                INSERT INTO admin_audit_logs
+                (admin_id, action, description)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    session["admin_id"],
+                    "logout",
+                    "Admin logged out"
+                )
+            )
+
+        db.commit()
+
+    finally:
+        db.close()
+
+    return jsonify({
+        "success": True,
+        "message": "Admin logged out"
+    })
+
+
+@app.route("/api/admin/dashboard", methods=["GET"])
+@admin_required
+def admin_dashboard():
+    db = get_db()
+
+    try:
+        total_users = db.execute(
+            "SELECT COUNT(*) AS count FROM users"
+        ).fetchone()["count"]
+
+        new_users_today = db.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM users
+            WHERE date(created_at) = date('now')
+            """
+        ).fetchone()["count"]
+
+        total_transactions = db.execute(
+            "SELECT COUNT(*) AS count FROM transactions"
+        ).fetchone()["count"]
+
+        total_withdrawals = db.execute(
+            "SELECT COUNT(*) AS count FROM withdrawals"
+        ).fetchone()["count"]
+
+        pending_withdrawals = db.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM withdrawals
+            WHERE status = 'pending'
+            """
+        ).fetchone()["count"]
+
+        total_balance = db.execute(
+            """
+            SELECT COALESCE(SUM(balance), 0) AS total
+            FROM users
+            """
+        ).fetchone()["total"]
+
+        platform_revenue = db.execute(
+            """
+            SELECT COALESCE(SUM(amount), 0) AS total
+            FROM platform_revenue
+            """
+        ).fetchone()["total"]
+
+        users = db.execute(
+            """
+            SELECT id, name, email, balance,
+                   currency, account_id, created_at
+            FROM users
+            ORDER BY id DESC
+            LIMIT 100
+            """
+        ).fetchall()
+
+        transactions = db.execute(
+            """
+            SELECT
+                t.id,
+                t.user_id,
+                u.name,
+                u.email,
+                t.type,
+                t.amount,
+                t.currency,
+                t.description,
+                t.created_at
+            FROM transactions t
+            LEFT JOIN users u ON u.id = t.user_id
+            ORDER BY t.id DESC
+            LIMIT 100
+            """
+        ).fetchall()
+
+        withdrawals = db.execute(
+            """
+            SELECT
+                w.id,
+                w.user_id,
+                u.name,
+                u.email,
+                w.amount,
+                w.currency,
+                w.method,
+                w.account,
+                w.status,
+                w.created_at
+            FROM withdrawals w
+            LEFT JOIN users u ON u.id = w.user_id
+            ORDER BY w.id DESC
+            LIMIT 100
+            """
+        ).fetchall()
+
+        revenue = db.execute(
+            """
+            SELECT id, type, amount, currency,
+                   description, created_at
+            FROM platform_revenue
+            ORDER BY id DESC
+            LIMIT 100
+            """
+        ).fetchall()
+
+    finally:
+        db.close()
+
+    return jsonify({
+        "success": True,
+        "stats": {
+            "total_users": total_users,
+            "new_users_today": new_users_today,
+            "total_transactions": total_transactions,
+            "total_withdrawals": total_withdrawals,
+            "pending_withdrawals": pending_withdrawals,
+            "total_balance": total_balance,
+            "platform_revenue": platform_revenue
+        },
+        "users": [dict(row) for row in users],
+        "transactions": [dict(row) for row in transactions],
+        "withdrawals": [dict(row) for row in withdrawals],
+        "revenue": [dict(row) for row in revenue]
+    })
+
+
+@app.route("/api/admin/users", methods=["GET"])
+@admin_required
+def admin_users():
+    db = get_db()
+
+    try:
+        rows = db.execute(
+            """
+            SELECT id, name, email, balance,
+                   currency, account_id, created_at
+            FROM users
+            ORDER BY id DESC
+            """
+        ).fetchall()
+    finally:
+        db.close()
+
+    return jsonify({
+        "success": True,
+        "users": [dict(row) for row in rows]
+    })
+
+
+@app.route("/api/admin/withdrawals", methods=["GET"])
+@admin_required
+def admin_withdrawals():
+    db = get_db()
+
+    try:
+        rows = db.execute(
+            """
+            SELECT
+                w.id,
+                w.user_id,
+                u.name,
+                u.email,
+                w.amount,
+                w.currency,
+                w.method,
+                w.account,
+                w.status,
+                w.created_at
+            FROM withdrawals w
+            LEFT JOIN users u ON u.id = w.user_id
+            ORDER BY w.id DESC
+            """
+        ).fetchall()
+    finally:
+        db.close()
+
+    return jsonify({
+        "success": True,
+        "withdrawals": [dict(row) for row in rows]
+    })
+
+
+@app.route("/api/admin/audit-logs", methods=["GET"])
+@admin_required
+def admin_audit_logs():
+    db = get_db()
+
+    try:
+        rows = db.execute(
+            """
+            SELECT
+                l.id,
+                l.admin_id,
+                a.name AS admin_name,
+                a.email AS admin_email,
+                l.action,
+                l.description,
+                l.created_at
+            FROM admin_audit_logs l
+            LEFT JOIN admins a ON a.id = l.admin_id
+            ORDER BY l.id DESC
+            LIMIT 100
+            """
+        ).fetchall()
+    finally:
+        db.close()
+
+    return jsonify({
+        "success": True,
+        "logs": [dict(row) for row in rows]
     })
 
 
