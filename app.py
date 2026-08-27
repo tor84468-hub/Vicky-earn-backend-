@@ -115,7 +115,7 @@ def register():
             if existing:
                 return jsonify({
                     "success": False,
-                    "message": "Email already registered"
+                    "message": "An account with this email already exists. Please log in."
                 }), 409
 
             account_id = generate_account_id(db)
