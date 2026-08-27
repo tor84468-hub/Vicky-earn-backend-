@@ -2,6 +2,7 @@ import os
 import sqlite3
 import secrets
 import time
+from contextlib import contextmanager
 
 DATABASE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -26,6 +27,27 @@ def get_db():
     connection.execute("PRAGMA temp_store = MEMORY")
 
     return connection
+
+
+@contextmanager
+def transaction():
+    """
+    Run database operations inside one atomic SQLite transaction.
+
+    Everything inside the block is committed together.
+    If anything fails, everything is rolled back.
+    """
+    db = get_db()
+
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 def execute_with_retry(db, sql, params=(), retries=8):
