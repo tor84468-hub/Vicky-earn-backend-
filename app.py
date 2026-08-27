@@ -55,12 +55,28 @@ def register():
 
     password_hash = generate_password_hash(password)
 
+    # Generate a unique Vicky Earn account number for every user.
+    import secrets
+
+    while True:
+        account_id = "VKY-" + "".join(
+            str(secrets.randbelow(10)) for _ in range(10)
+        )
+
+        exists = db.execute(
+            "SELECT id FROM users WHERE account_id = ?",
+            (account_id,)
+        ).fetchone()
+
+        if not exists:
+            break
+
     cursor = db.execute(
         """
-        INSERT INTO users (name, email, password)
-        VALUES (?, ?, ?)
+        INSERT INTO users (name, email, password, account_id)
+        VALUES (?, ?, ?, ?)
         """,
-        (name, email, password_hash)
+        (name, email, password_hash, account_id)
     )
 
     db.commit()
@@ -76,7 +92,8 @@ def register():
             "id": user_id,
             "name": name,
             "email": email,
-            "balance": 0
+            "balance": 0,
+            "account_id": account_id
         }
     }), 201
 

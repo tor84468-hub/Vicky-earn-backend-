@@ -136,18 +136,32 @@ def init_db():
         )
     """)
 
-    # Give existing users Account IDs if they don't have one.
-    users = db.execute("""
-        SELECT id
-        FROM users
-        WHERE account_id IS NULL OR account_id = ''
-    """).fetchall()
-
+    # Ensure every user has a unique Vicky Earn account number.
+    # Format: VKY-XXXXXXXXXX (10 digits).
     import secrets
 
+    users = db.execute("""
+        SELECT id, account_id
+        FROM users
+        ORDER BY id
+    """).fetchall()
+
     for user in users:
+        current = str(user["account_id"] or "").strip().upper()
+
+        # Keep only valid VKY-10-digit account numbers.
+        if (
+            len(current) == 14
+            and current.startswith("VKY-")
+            and current[4:].isdigit()
+        ):
+            continue
+
         while True:
-            account_id = "VKY-" + secrets.token_hex(3).upper()
+            account_id = "VKY-" + "".join(
+                str(secrets.randbelow(10)) for _ in range(10)
+            )
+
             exists = db.execute(
                 "SELECT id FROM users WHERE account_id = ?",
                 (account_id,)
