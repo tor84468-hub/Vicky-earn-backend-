@@ -1779,8 +1779,10 @@ def ensure_env_admin():
         db.close()
 
 
+# Initialize the deployment admin when Flask/Gunicorn imports this module.
+ensure_env_admin()
+
 if __name__ == "__main__":
-    ensure_env_admin()
     print("Vicky Earn API starting...")
     app.run(
         host="0.0.0.0",
