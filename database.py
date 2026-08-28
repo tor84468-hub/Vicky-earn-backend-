@@ -1,46 +1,181 @@
 import os
-import sqlite3
+import re
 import secrets
-import time
 from contextlib import contextmanager
 
-DATABASE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "vicky_earn.db"
-)
+import psycopg
+from psycopg.rows import dict_row
+
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL environment variable is required."
+    )
+
+
+class CursorCompat:
+    """
+    Small compatibility wrapper so the existing Vicky Earn app
+    can continue using SQLite-style '?' parameters and
+    cursor.lastrowid while the actual database is PostgreSQL.
+    """
+
+    def __init__(self, cursor):
+        self.cursor = cursor
+        self._lastrowid = None
+
+    @property
+    def rowcount(self):
+        return self.cursor.rowcount
+
+    @property
+    def lastrowid(self):
+        return self._lastrowid
+
+    def fetchone(self):
+        return self.cursor.fetchone()
+
+    def fetchall(self):
+        return self.cursor.fetchall()
+
+    def __iter__(self):
+        return iter(self.cursor)
+
+
+class DBCompat:
+    """
+    PostgreSQL connection with compatibility for the existing
+    SQLite-oriented Vicky Earn application.
+    """
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def _convert_sql(self, sql):
+        # Existing app uses SQLite '?' parameters.
+        sql = sql.replace("?", "%s")
+
+        # SQLite date('now') -> PostgreSQL CURRENT_DATE
+        sql = re.sub(
+            r"date\(\s*'now'\s*\)",
+            "CURRENT_DATE",
+            sql,
+            flags=re.IGNORECASE
+        )
+
+        # SQLite datetime('now') -> PostgreSQL CURRENT_TIMESTAMP
+        sql = re.sub(
+            r"datetime\(\s*'now'\s*\)",
+            "CURRENT_TIMESTAMP",
+            sql,
+            flags=re.IGNORECASE
+        )
+
+        # SQLite datetime('now', '+7 days')
+        sql = re.sub(
+            r"datetime\(\s*'now'\s*,\s*'\+7 days'\s*\)",
+            "(CURRENT_TIMESTAMP + INTERVAL '7 days')",
+            sql,
+            flags=re.IGNORECASE
+        )
+
+        return sql
+
+    def execute(self, sql, params=()):
+        converted = self._convert_sql(sql)
+
+        # PostgreSQL does not provide SQLite's cursor.lastrowid.
+        # For INSERT statements into our tables, automatically add
+        # RETURNING id when possible so the existing app can continue
+        # using cursor.lastrowid.
+        stripped = converted.strip()
+
+        is_insert = stripped.upper().startswith("INSERT INTO ")
+        has_returning = " RETURNING " in stripped.upper()
+
+        if is_insert and not has_returning:
+            # Only add RETURNING id to INSERT statements that insert
+            # into normal application tables.
+            match = re.match(
+                r"INSERT\s+INTO\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+                stripped,
+                flags=re.IGNORECASE
+            )
+
+            if match:
+                table = match.group(1)
+
+                if table not in {
+                    "sqlite_sequence"
+                }:
+                    converted = converted.rstrip().rstrip(";")
+                    converted += " RETURNING id"
+
+                    cursor = self.connection.execute(
+                        converted,
+                        params
+                    )
+
+                    wrapper = CursorCompat(cursor)
+
+                    row = cursor.fetchone()
+
+                    if row and "id" in row:
+                        wrapper._lastrowid = row["id"]
+
+                    return wrapper
+
+        cursor = self.connection.execute(
+            converted,
+            params
+        )
+
+        return CursorCompat(cursor)
+
+    def executemany(self, sql, params_list):
+        converted = self._convert_sql(sql)
+
+        self.connection.executemany(
+            converted,
+            params_list
+        )
+
+    def commit(self):
+        self.connection.commit()
+
+    def rollback(self):
+        self.connection.rollback()
+
+    def close(self):
+        self.connection.close()
 
 
 def get_db():
-    connection = sqlite3.connect(
-        DATABASE,
-        timeout=60,
-        check_same_thread=False
+    """
+    Open a PostgreSQL database connection using Render's
+    DATABASE_URL environment variable.
+    """
+
+    connection = psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row
     )
 
-    connection.row_factory = sqlite3.Row
-
-    # SQLite reliability/concurrency settings.
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 60000")
-    connection.execute("PRAGMA journal_mode = WAL")
-    connection.execute("PRAGMA synchronous = NORMAL")
-    connection.execute("PRAGMA temp_store = MEMORY")
-
-    return connection
+    return DBCompat(connection)
 
 
 @contextmanager
 def transaction():
     """
-    Run database operations inside one atomic SQLite transaction.
-
-    Everything inside the block is committed together.
-    If anything fails, everything is rolled back.
+    Run database operations inside one atomic PostgreSQL transaction.
     """
+
     db = get_db()
 
     try:
-        db.execute("BEGIN IMMEDIATE")
         yield db
         db.commit()
     except Exception:
@@ -50,37 +185,51 @@ def transaction():
         db.close()
 
 
-def execute_with_retry(db, sql, params=(), retries=8):
+def execute_with_retry(db, sql, params=(), retries=3):
     """
-    Execute a database statement with retry handling for
-    temporary SQLite locking.
+    PostgreSQL-compatible execute helper.
+
+    Kept for compatibility with the existing application.
     """
+
+    last_error = None
+
     for attempt in range(retries):
         try:
             return db.execute(sql, params)
-        except sqlite3.OperationalError as error:
-            if "database is locked" not in str(error).lower():
-                raise
+        except psycopg.OperationalError as error:
+            last_error = error
 
             if attempt == retries - 1:
                 raise
 
-            time.sleep(0.25 * (attempt + 1))
+    raise last_error
 
 
 def column_exists(db, table, column):
-    rows = db.execute(
-        f"PRAGMA table_info({table})"
-    ).fetchall()
+    """
+    Check whether a PostgreSQL table contains a column.
+    """
 
-    return any(row["name"] == column for row in rows)
+    result = db.execute(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = %s
+          AND column_name = %s
+        LIMIT 1
+        """,
+        (table, column)
+    ).fetchone()
+
+    return result is not None
 
 
 def add_column_if_missing(db, table, column, definition):
     if not column_exists(db, table, column):
-        execute_with_retry(
-            db,
-            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        db.execute(
+            f'ALTER TABLE "{table}" ADD COLUMN "{column}" {definition}'
         )
 
 
@@ -90,9 +239,6 @@ def generate_account_id(db):
 
     Format:
         VKY-XXXXXXXXXX
-
-    Example:
-        VKY-4829173056
     """
 
     while True:
@@ -102,7 +248,7 @@ def generate_account_id(db):
         )
 
         existing = db.execute(
-            "SELECT id FROM users WHERE account_id = ?",
+            "SELECT id FROM users WHERE account_id = %s",
             (account_id,)
         ).fetchone()
 
@@ -114,21 +260,23 @@ def init_db():
     db = get_db()
 
     try:
-        # Main users table.
+        # ========================================================
+        # USERS
+        # ========================================================
+
         db.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
                 email TEXT UNIQUE NOT NULL,
                 password TEXT NOT NULL,
-                balance REAL NOT NULL DEFAULT 0,
+                balance DOUBLE PRECISION NOT NULL DEFAULT 0,
                 currency TEXT NOT NULL DEFAULT 'NGN',
                 account_id TEXT UNIQUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
-        # Upgrade older databases safely.
         add_column_if_missing(
             db,
             "users",
@@ -143,13 +291,16 @@ def init_db():
             "TEXT"
         )
 
-        # Transactions.
+        # ========================================================
+        # TRANSACTIONS
+        # ========================================================
+
         db.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
                 type TEXT NOT NULL,
-                amount REAL NOT NULL,
+                amount DOUBLE PRECISION NOT NULL,
                 description TEXT,
                 currency TEXT NOT NULL DEFAULT 'NGN',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -164,23 +315,29 @@ def init_db():
             "TEXT NOT NULL DEFAULT 'NGN'"
         )
 
-        # Earning tasks.
+        # ========================================================
+        # TASKS
+        # ========================================================
+
         db.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 title TEXT NOT NULL,
                 description TEXT,
-                reward REAL NOT NULL DEFAULT 0,
+                reward DOUBLE PRECISION NOT NULL DEFAULT 0,
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
-        # Notifications.
+        # ========================================================
+        # NOTIFICATIONS
+        # ========================================================
+
         db.execute("""
             CREATE TABLE IF NOT EXISTS notifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
                 title TEXT NOT NULL,
                 message TEXT NOT NULL,
                 read INTEGER NOT NULL DEFAULT 0,
@@ -189,12 +346,15 @@ def init_db():
             )
         """)
 
-        # Withdrawals.
+        # ========================================================
+        # WITHDRAWALS
+        # ========================================================
+
         db.execute("""
             CREATE TABLE IF NOT EXISTS withdrawals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                amount REAL NOT NULL,
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                amount DOUBLE PRECISION NOT NULL,
                 currency TEXT NOT NULL DEFAULT 'NGN',
                 method TEXT NOT NULL,
                 account TEXT NOT NULL,
@@ -204,21 +364,72 @@ def init_db():
             )
         """)
 
-        # Referrals.
+        # ========================================================
+        # REFERRALS
+        # ========================================================
+
         db.execute("""
             CREATE TABLE IF NOT EXISTS referrals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                referred_user_id INTEGER,
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                referred_user_id BIGINT,
                 referral_code TEXT,
-                reward REAL NOT NULL DEFAULT 0,
+                reward DOUBLE PRECISION NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id),
                 FOREIGN KEY (referred_user_id) REFERENCES users(id)
             )
         """)
 
-        # Ensure every user has a valid unique account number.
+        # ========================================================
+        # ADMIN TABLES
+        # ========================================================
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+                id BIGSERIAL PRIMARY KEY,
+                admin_id BIGINT NOT NULL,
+                token TEXT UNIQUE NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS platform_revenue (
+                id BIGSERIAL PRIMARY KEY,
+                type TEXT NOT NULL,
+                amount DOUBLE PRECISION NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'NGN',
+                description TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS admin_audit_logs (
+                id BIGSERIAL PRIMARY KEY,
+                admin_id BIGINT,
+                action TEXT NOT NULL,
+                description TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # ========================================================
+        # ACCOUNT IDs
+        # ========================================================
+
         users = db.execute("""
             SELECT id, account_id
             FROM users
@@ -241,17 +452,19 @@ def init_db():
 
             account_id = generate_account_id(db)
 
-            execute_with_retry(
-                db,
+            db.execute(
                 """
                 UPDATE users
-                SET account_id = ?
-                WHERE id = ?
+                SET account_id = %s
+                WHERE id = %s
                 """,
                 (account_id, user["id"])
             )
 
-        # Seed earning tasks.
+        # ========================================================
+        # SEED TASKS
+        # ========================================================
+
         task_count = db.execute(
             "SELECT COUNT(*) AS count FROM tasks"
         ).fetchone()["count"]
@@ -260,7 +473,7 @@ def init_db():
             db.executemany("""
                 INSERT INTO tasks
                 (title, description, reward, active)
-                VALUES (?, ?, ?, 1)
+                VALUES (%s, %s, %s, 1)
             """, [
                 (
                     "Daily check-in",
@@ -287,4 +500,4 @@ def init_db():
 
 if __name__ == "__main__":
     init_db()
-    print("Vicky Earn database initialized successfully.")
+    print("Vicky Earn PostgreSQL database initialized successfully.")

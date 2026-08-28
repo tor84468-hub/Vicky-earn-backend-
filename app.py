@@ -1,5 +1,5 @@
 import os
-import sqlite3
+import psycopg
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -152,7 +152,7 @@ def register():
             }
         }), 201
 
-    except sqlite3.IntegrityError:
+    except psycopg.IntegrityError:
         return jsonify({
             "success": False,
             "message": "Email or account ID already exists"
@@ -1679,7 +1679,7 @@ def ensure_admin_tables():
     try:
         db.execute("""
             CREATE TABLE IF NOT EXISTS admins (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
                 email TEXT UNIQUE NOT NULL,
                 password TEXT NOT NULL,
@@ -1689,7 +1689,7 @@ def ensure_admin_tables():
 
         db.execute("""
             CREATE TABLE IF NOT EXISTS admin_sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 admin_id INTEGER NOT NULL,
                 token TEXT UNIQUE NOT NULL,
                 expires_at TIMESTAMP NOT NULL,
@@ -1699,7 +1699,7 @@ def ensure_admin_tables():
 
         db.execute("""
             CREATE TABLE IF NOT EXISTS platform_revenue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 type TEXT NOT NULL,
                 amount REAL NOT NULL,
                 currency TEXT NOT NULL DEFAULT 'NGN',
@@ -1710,7 +1710,7 @@ def ensure_admin_tables():
 
         db.execute("""
             CREATE TABLE IF NOT EXISTS admin_audit_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 admin_id INTEGER,
                 action TEXT NOT NULL,
                 description TEXT,
