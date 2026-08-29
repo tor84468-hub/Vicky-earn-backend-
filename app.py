@@ -159,6 +159,39 @@ def register():
         }), 409
 
 
+
+def create_user_session(user_id):
+    """
+    Create a long-lived Vicky Earn login session.
+
+    Each device receives its own token. The token is stored
+    server-side, allowing the login to survive browser/app
+    restarts and remain available across devices.
+    """
+
+    token = secrets.token_urlsafe(64)
+
+    db = get_db()
+
+    try:
+        db.execute(
+            """
+            INSERT INTO user_sessions
+                (user_id, token, expires_at, last_used_at)
+            VALUES
+                (?, ?, CURRENT_TIMESTAMP + INTERVAL '10 years',
+                 CURRENT_TIMESTAMP)
+            """,
+            (user_id, token)
+        )
+
+        db.commit()
+        return token
+
+    finally:
+        db.close()
+
+
 @app.route("/api/auth/login", methods=["POST"])
 def login():
     data = request.get_json(silent=True) or {}
@@ -192,9 +225,13 @@ def login():
             "message": "Invalid email or password"
         }), 401
 
+    # Create a long-lived server-side session for this device.
+    session_token = create_user_session(user["id"])
+
     return jsonify({
         "success": True,
         "message": "Login successful",
+        "session_token": session_token,
         "user": {
             "id": user["id"],
             "name": user["name"],
@@ -203,6 +240,103 @@ def login():
             "currency": user["currency"],
             "account_id": user["account_id"]
         }
+    })
+
+
+@app.route("/api/auth/session", methods=["GET"])
+def restore_session():
+    auth = request.headers.get("Authorization", "")
+
+    if not auth.startswith("Bearer "):
+        return jsonify({
+            "success": False,
+            "message": "Authentication required"
+        }), 401
+
+    token = auth[7:].strip()
+
+    if not token:
+        return jsonify({
+            "success": False,
+            "message": "Invalid session"
+        }), 401
+
+    db = get_db()
+
+    try:
+        session = db.execute(
+            """
+            SELECT
+                s.user_id,
+                u.name,
+                u.email,
+                u.balance,
+                u.currency,
+                u.account_id
+            FROM user_sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.token = ?
+              AND s.expires_at > CURRENT_TIMESTAMP
+            """,
+            (token,)
+        ).fetchone()
+
+        if not session:
+            return jsonify({
+                "success": False,
+                "message": "Session expired"
+            }), 401
+
+        db.execute(
+            """
+            UPDATE user_sessions
+            SET last_used_at = CURRENT_TIMESTAMP,
+                expires_at = CURRENT_TIMESTAMP + INTERVAL '365 days'
+            WHERE token = ?
+            """,
+            (token,)
+        )
+
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "user": {
+                "id": session["user_id"],
+                "name": session["name"],
+                "email": session["email"],
+                "balance": session["balance"],
+                "currency": session["currency"],
+                "account_id": session["account_id"]
+            }
+        })
+
+    finally:
+        db.close()
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def user_logout():
+    auth = request.headers.get("Authorization", "")
+
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+
+        if token:
+            db = get_db()
+
+            try:
+                db.execute(
+                    "DELETE FROM user_sessions WHERE token = ?",
+                    (token,)
+                )
+                db.commit()
+            finally:
+                db.close()
+
+    return jsonify({
+        "success": True,
+        "message": "Logged out successfully"
     })
 
 
@@ -1724,6 +1858,35 @@ def ensure_admin_tables():
 
 
 ensure_admin_tables()
+
+
+
+# ============================================================
+# USER CROSS-DEVICE SESSIONS
+# ============================================================
+
+def ensure_user_session_table():
+    db = get_db()
+
+    try:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                token TEXT UNIQUE NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+
+        db.commit()
+    finally:
+        db.close()
+
+
+ensure_user_session_table()
 
 
 def ensure_env_admin():
