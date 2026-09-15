@@ -154,11 +154,19 @@ def register():
             }
         }), 201
 
-    except psycopg.IntegrityError:
+    except psycopg.IntegrityError as e:
         return jsonify({
             "success": False,
-            "message": "Email or account ID already exists"
+            "message": "Email or account ID already exists",
+            "error": str(e)
         }), 409
+    except Exception as e:
+        app.logger.exception("Registration failed")
+        return jsonify({
+            "success": False,
+            "message": "Account could not be created",
+            "error": str(e)
+        }), 500
 
 
 
