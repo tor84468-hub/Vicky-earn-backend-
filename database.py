@@ -138,10 +138,14 @@ class DBCompat:
     def executemany(self, sql, params_list):
         converted = self._convert_sql(sql)
 
-        self.connection.executemany(
-            converted,
-            params_list
-        )
+        last_cursor = None
+        for params in params_list:
+            last_cursor = self.connection.execute(
+                converted,
+                params
+            )
+
+        return last_cursor
 
     def commit(self):
         self.connection.commit()
