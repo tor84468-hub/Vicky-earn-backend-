@@ -14,7 +14,6 @@ from webauthn import (
     verify_authentication_response,
     options_to_json,
     base64url_to_bytes,
-    bytes_to_base64url,
 )
 from webauthn.helpers.structs import (
     AuthenticatorAttachment,
@@ -27,6 +26,11 @@ from webauthn.helpers.exceptions import (
     InvalidRegistrationResponse,
     InvalidAuthenticationResponse,
 )
+import base64
+
+def bytes_to_base64url(value):
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
 from webauthn_config import (
     WEBAUTHN_RP_ID,
     WEBAUTHN_RP_NAME,
