@@ -2060,67 +2060,74 @@ def _user_value(row, key, default=None):
 
 @app.post("/api/auth/webauthn/register/options")
 def webauthn_register_options():
-    user = _webauthn_user_from_session()
+    try:
+        user = _webauthn_user_from_session()
 
-    if not user:
+        if not user:
+            return jsonify({
+                "success": False,
+                "error": "Authentication required."
+            }), 401
+
+        db = get_db()
+        try:
+            existing = db.execute("""
+                SELECT credential_id
+                FROM user_webauthn_credentials
+                WHERE user_id = %s
+            """, (user["id"],)).fetchall()
+        finally:
+            db.close()
+
+        exclude_credentials = [
+            PublicKeyCredentialDescriptor(
+                id=base64url_to_bytes(row["credential_id"])
+            )
+            for row in existing
+        ]
+
+        user_handle = __import__("hashlib").sha256(
+            f"vicky-webauthn-user:{user['id']}".encode()
+        ).digest()
+
+        options = generate_registration_options(
+            rp_id=WEBAUTHN_RP_ID,
+            rp_name=WEBAUTHN_RP_NAME,
+            user_id=user_handle,
+            user_name=str(
+                _user_value(user, "email")
+                or _user_value(user, "username")
+                or user["id"]
+            ),
+            user_display_name=str(
+                _user_value(user, "name")
+                or _user_value(user, "full_name")
+                or _user_value(user, "email")
+                or user["id"]
+            ),
+            exclude_credentials=exclude_credentials,
+            authenticator_selection=AuthenticatorSelectionCriteria(
+                authenticator_attachment=AuthenticatorAttachment.PLATFORM,
+                resident_key=ResidentKeyRequirement.REQUIRED,
+                user_verification=UserVerificationRequirement.REQUIRED,
+            ),
+        )
+
+        challenge = bytes_to_base64url(options.challenge)
+
+        _webauthn_save_challenge(
+            user["id"],
+            challenge,
+            "registration"
+        )
+
+        return jsonify(json.loads(options_to_json(options)))
+
+    except Exception as exc:
         return jsonify({
             "success": False,
-            "error": "Authentication required."
-        }), 401
-
-    db = get_db()
-    try:
-        existing = db.execute("""
-            SELECT credential_id
-            FROM user_webauthn_credentials
-            WHERE user_id = %s
-        """, (user["id"],)).fetchall()
-    finally:
-        db.close()
-
-    exclude_credentials = [
-        PublicKeyCredentialDescriptor(
-            id=base64url_to_bytes(row["credential_id"])
-        )
-        for row in existing
-    ]
-
-    user_handle = __import__("hashlib").sha256(
-        f"vicky-webauthn-user:{user['id']}".encode()
-    ).digest()
-
-    options = generate_registration_options(
-        rp_id=WEBAUTHN_RP_ID,
-        rp_name=WEBAUTHN_RP_NAME,
-        user_id=user_handle,
-        user_name=str(
-            _user_value(user, "email")
-            or _user_value(user, "username")
-            or user["id"]
-        ),
-        user_display_name=str(
-            _user_value(user, "name")
-            or _user_value(user, "full_name")
-            or _user_value(user, "email")
-            or user["id"]
-        ),
-        exclude_credentials=exclude_credentials,
-        authenticator_selection=AuthenticatorSelectionCriteria(
-            authenticator_attachment=AuthenticatorAttachment.PLATFORM,
-            resident_key=ResidentKeyRequirement.REQUIRED,
-            user_verification=UserVerificationRequirement.REQUIRED,
-        ),
-    )
-
-    challenge = bytes_to_base64url(options.challenge)
-
-    _webauthn_save_challenge(
-        user["id"],
-        challenge,
-        "registration"
-    )
-
-    return jsonify(json.loads(options_to_json(options)))
+            "error": f"WebAuthn registration options failed: {exc}"
+        }), 500
 
 
 @app.post("/api/auth/webauthn/register/verify")
@@ -2223,20 +2230,27 @@ def webauthn_register_verify():
 
 @app.post("/api/auth/webauthn/login/options")
 def webauthn_login_options():
-    options = generate_authentication_options(
-        rp_id=WEBAUTHN_RP_ID,
-        user_verification=UserVerificationRequirement.REQUIRED,
-    )
+    try:
+        options = generate_authentication_options(
+            rp_id=WEBAUTHN_RP_ID,
+            user_verification=UserVerificationRequirement.REQUIRED,
+        )
 
-    challenge = bytes_to_base64url(options.challenge)
+        challenge = bytes_to_base64url(options.challenge)
 
-    _webauthn_save_challenge(
-        None,
-        challenge,
-        "authentication"
-    )
+        _webauthn_save_challenge(
+            None,
+            challenge,
+            "authentication"
+        )
 
-    return jsonify(json.loads(options_to_json(options)))
+        return jsonify(json.loads(options_to_json(options)))
+
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "error": f"WebAuthn login options failed: {exc}"
+        }), 500
 
 
 @app.post("/api/auth/webauthn/login/verify")
