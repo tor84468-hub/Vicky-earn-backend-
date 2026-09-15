@@ -3,3 +3,5 @@ flask-cors
 gunicorn
 psycopg==3.3.4
 requests>=2.31.0
+
+webauthn==2.7.0

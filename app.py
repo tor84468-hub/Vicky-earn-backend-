@@ -7,6 +7,32 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from database import init_db, get_db, transaction, generate_account_id
 from vickycoin_config import vic_enabled, vic_get_balance, vic_get_transaction, vic_get_status
 
+from webauthn import (
+    generate_registration_options,
+    generate_authentication_options,
+    verify_registration_response,
+    verify_authentication_response,
+    options_to_json,
+    base64url_to_bytes,
+    bytes_to_base64url,
+)
+from webauthn.helpers.structs import (
+    AuthenticatorAttachment,
+    AuthenticatorSelectionCriteria,
+    PublicKeyCredentialDescriptor,
+    ResidentKeyRequirement,
+    UserVerificationRequirement,
+)
+from webauthn.helpers.exceptions import (
+    InvalidRegistrationResponse,
+    InvalidAuthenticationResponse,
+)
+from webauthn_config import (
+    WEBAUTHN_RP_ID,
+    WEBAUTHN_RP_NAME,
+    WEBAUTHN_ORIGIN,
+)
+
 app = Flask(__name__)
 CORS(
     app,
@@ -1897,6 +1923,440 @@ def ensure_user_session_table():
 
 
 ensure_user_session_table()
+
+
+# ============================================================
+# USER WEBAUTHN / PASSKEY CREDENTIALS
+# ============================================================
+
+def ensure_user_webauthn_table():
+    db = get_db()
+    try:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS user_webauthn_credentials (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                credential_id TEXT UNIQUE NOT NULL,
+                public_key TEXT NOT NULL,
+                sign_count BIGINT NOT NULL DEFAULT 0,
+                device_name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        db.commit()
+    finally:
+        db.close()
+
+ensure_user_webauthn_table()
+
+
+def ensure_webauthn_challenge_table():
+    db = get_db()
+    try:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS webauthn_challenges (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT,
+                challenge TEXT UNIQUE NOT NULL,
+                ceremony TEXT NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        db.commit()
+    finally:
+        db.close()
+
+ensure_webauthn_challenge_table()
+
+
+
+
+# ============================================================
+# WEBAUTHN / FINGERPRINT LOGIN
+# ============================================================
+
+def _webauthn_user_from_session():
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+
+    token = auth.split(" ", 1)[1].strip()
+    if not token:
+        return None
+
+    db = get_db()
+    try:
+        row = db.execute("""
+            SELECT u.*
+            FROM user_sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.token = %s
+              AND s.expires_at > CURRENT_TIMESTAMP
+        """, (token,)).fetchone()
+        return row
+    finally:
+        db.close()
+
+
+def _webauthn_save_challenge(user_id, challenge, ceremony):
+    db = get_db()
+    try:
+        db.execute("""
+            DELETE FROM webauthn_challenges
+            WHERE expires_at <= CURRENT_TIMESTAMP
+               OR ceremony = %s
+        """, (ceremony,))
+
+        db.execute("""
+            INSERT INTO webauthn_challenges
+                (user_id, challenge, ceremony, expires_at)
+            VALUES
+                (%s, %s, %s, CURRENT_TIMESTAMP + INTERVAL '5 minutes')
+        """, (user_id, challenge, ceremony))
+
+        db.commit()
+    finally:
+        db.close()
+
+
+def _webauthn_get_challenge(challenge, ceremony):
+    db = get_db()
+    try:
+        row = db.execute("""
+            SELECT *
+            FROM webauthn_challenges
+            WHERE challenge = %s
+              AND ceremony = %s
+              AND expires_at > CURRENT_TIMESTAMP
+            LIMIT 1
+        """, (challenge, ceremony)).fetchone()
+
+        if row:
+            db.execute(
+                "DELETE FROM webauthn_challenges WHERE id = %s",
+                (row["id"],)
+            )
+            db.commit()
+
+        return row
+    finally:
+        db.close()
+
+
+def _user_value(row, key, default=None):
+    try:
+        return row[key]
+    except Exception:
+        return default
+
+
+@app.post("/api/auth/webauthn/register/options")
+def webauthn_register_options():
+    user = _webauthn_user_from_session()
+
+    if not user:
+        return jsonify({
+            "success": False,
+            "error": "Authentication required."
+        }), 401
+
+    db = get_db()
+    try:
+        existing = db.execute("""
+            SELECT credential_id
+            FROM user_webauthn_credentials
+            WHERE user_id = %s
+        """, (user["id"],)).fetchall()
+    finally:
+        db.close()
+
+    exclude_credentials = [
+        PublicKeyCredentialDescriptor(
+            id=base64url_to_bytes(row["credential_id"])
+        )
+        for row in existing
+    ]
+
+    user_handle = __import__("hashlib").sha256(
+        f"vicky-webauthn-user:{user['id']}".encode()
+    ).digest()
+
+    options = generate_registration_options(
+        rp_id=WEBAUTHN_RP_ID,
+        rp_name=WEBAUTHN_RP_NAME,
+        user_id=user_handle,
+        user_name=str(
+            _user_value(user, "email")
+            or _user_value(user, "username")
+            or user["id"]
+        ),
+        user_display_name=str(
+            _user_value(user, "name")
+            or _user_value(user, "full_name")
+            or _user_value(user, "email")
+            or user["id"]
+        ),
+        exclude_credentials=exclude_credentials,
+        authenticator_selection=AuthenticatorSelectionCriteria(
+            authenticator_attachment=AuthenticatorAttachment.PLATFORM,
+            resident_key=ResidentKeyRequirement.REQUIRED,
+            user_verification=UserVerificationRequirement.REQUIRED,
+        ),
+    )
+
+    challenge = bytes_to_base64url(options.challenge)
+
+    _webauthn_save_challenge(
+        user["id"],
+        challenge,
+        "registration"
+    )
+
+    return jsonify(json.loads(options_to_json(options)))
+
+
+@app.post("/api/auth/webauthn/register/verify")
+def webauthn_register_verify():
+    user = _webauthn_user_from_session()
+
+    if not user:
+        return jsonify({
+            "success": False,
+            "error": "Authentication required."
+        }), 401
+
+    credential = request.get_json(silent=True) or {}
+    client_data = credential.get("response", {})
+
+    raw_id = credential.get("rawId")
+    if not raw_id:
+        return jsonify({
+            "success": False,
+            "error": "Missing credential ID."
+        }), 400
+
+    client_data_json = client_data.get("clientDataJSON")
+    attestation_object = client_data.get("attestationObject")
+
+    if not client_data_json or not attestation_object:
+        return jsonify({
+            "success": False,
+            "error": "Invalid WebAuthn response."
+        }), 400
+
+    try:
+        parsed_client = json.loads(
+            base64url_to_bytes(client_data_json).decode("utf-8")
+        )
+
+        challenge = parsed_client.get("challenge")
+        if not challenge:
+            raise ValueError("Missing challenge.")
+
+        stored = _webauthn_get_challenge(
+            challenge,
+            "registration"
+        )
+
+        if not stored or stored["user_id"] != user["id"]:
+            return jsonify({
+                "success": False,
+                "error": "WebAuthn challenge expired or invalid."
+            }), 400
+
+        verification = verify_registration_response(
+            credential=credential,
+            expected_challenge=base64url_to_bytes(challenge),
+            expected_rp_id=WEBAUTHN_RP_ID,
+            expected_origin=WEBAUTHN_ORIGIN,
+        )
+
+        credential_id = bytes_to_base64url(
+            verification.credential_id
+        )
+
+        public_key = bytes_to_base64url(
+            verification.credential_public_key
+        )
+
+        db = get_db()
+        try:
+            db.execute("""
+                INSERT INTO user_webauthn_credentials
+                    (user_id, credential_id, public_key, sign_count)
+                VALUES
+                    (%s, %s, %s, %s)
+                ON CONFLICT (credential_id)
+                DO UPDATE SET
+                    public_key = EXCLUDED.public_key,
+                    sign_count = EXCLUDED.sign_count,
+                    last_used_at = CURRENT_TIMESTAMP
+            """, (
+                user["id"],
+                credential_id,
+                public_key,
+                verification.sign_count,
+            ))
+            db.commit()
+        finally:
+            db.close()
+
+        return jsonify({
+            "success": True,
+            "message": "Fingerprint login enabled."
+        })
+
+    except (InvalidRegistrationResponse, ValueError, KeyError, TypeError) as exc:
+        return jsonify({
+            "success": False,
+            "error": f"Fingerprint registration failed: {exc}"
+        }), 400
+
+
+@app.post("/api/auth/webauthn/login/options")
+def webauthn_login_options():
+    options = generate_authentication_options(
+        rp_id=WEBAUTHN_RP_ID,
+        user_verification=UserVerificationRequirement.REQUIRED,
+    )
+
+    challenge = bytes_to_base64url(options.challenge)
+
+    _webauthn_save_challenge(
+        None,
+        challenge,
+        "authentication"
+    )
+
+    return jsonify(json.loads(options_to_json(options)))
+
+
+@app.post("/api/auth/webauthn/login/verify")
+def webauthn_login_verify():
+    credential = request.get_json(silent=True) or {}
+
+    raw_id = credential.get("rawId")
+    if not raw_id:
+        return jsonify({
+            "success": False,
+            "error": "Missing credential ID."
+        }), 400
+
+    credential_id = bytes_to_base64url(
+        base64url_to_bytes(raw_id)
+    )
+
+    db = get_db()
+    try:
+        stored_credential = db.execute("""
+            SELECT *
+            FROM user_webauthn_credentials
+            WHERE credential_id = %s
+            LIMIT 1
+        """, (credential_id,)).fetchone()
+    finally:
+        db.close()
+
+    if not stored_credential:
+        return jsonify({
+            "success": False,
+            "error": "Fingerprint login is not registered on this device."
+        }), 404
+
+    client_data_json = (credential.get("response") or {}).get(
+        "clientDataJSON"
+    )
+
+    if not client_data_json:
+        return jsonify({
+            "success": False,
+            "error": "Invalid WebAuthn response."
+        }), 400
+
+    try:
+        parsed_client = json.loads(
+            base64url_to_bytes(client_data_json).decode("utf-8")
+        )
+
+        challenge = parsed_client.get("challenge")
+
+        if not challenge:
+            raise ValueError("Missing challenge.")
+
+        stored_challenge = _webauthn_get_challenge(
+            challenge,
+            "authentication"
+        )
+
+        if not stored_challenge:
+            return jsonify({
+                "success": False,
+                "error": "WebAuthn challenge expired or invalid."
+            }), 400
+
+        verification = verify_authentication_response(
+            credential=credential,
+            expected_challenge=base64url_to_bytes(challenge),
+            expected_rp_id=WEBAUTHN_RP_ID,
+            expected_origin=WEBAUTHN_ORIGIN,
+            credential_public_key=base64url_to_bytes(
+                stored_credential["public_key"]
+            ),
+            credential_current_sign_count=stored_credential["sign_count"],
+            require_user_verification=True,
+        )
+
+        db = get_db()
+        try:
+            db.execute("""
+                UPDATE user_webauthn_credentials
+                SET sign_count = %s,
+                    last_used_at = CURRENT_TIMESTAMP
+                WHERE credential_id = %s
+            """, (
+                verification.new_sign_count,
+                credential_id,
+            ))
+            db.commit()
+        finally:
+            db.close()
+
+        session_token = create_user_session(
+            stored_credential["user_id"]
+        )
+
+        db = get_db()
+        try:
+            user = db.execute("""
+                SELECT *
+                FROM users
+                WHERE id = %s
+                LIMIT 1
+            """, (stored_credential["user_id"],)).fetchone()
+        finally:
+            db.close()
+
+        if not user:
+            return jsonify({
+                "success": False,
+                "error": "User account no longer exists."
+            }), 404
+
+        return jsonify({
+            "success": True,
+            "session_token": session_token,
+            "user": dict(user),
+        })
+
+    except (InvalidAuthenticationResponse, ValueError, KeyError, TypeError) as exc:
+        return jsonify({
+            "success": False,
+            "error": f"Fingerprint login failed: {exc}"
+        }), 401
 
 
 def ensure_env_admin():
