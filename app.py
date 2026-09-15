@@ -1,6 +1,9 @@
 import json
 import os
 import psycopg
+import cloudinary
+import cloudinary.uploader
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -682,7 +685,7 @@ def update_currency():
     try:
         user = db.execute(
             """
-            SELECT id, name, email, balance, currency
+            SELECT id, name, email, balance, currency, avatar_url
             FROM users
             WHERE id = ?
             """,
@@ -1337,6 +1340,106 @@ def mark_notification_read(notification_id):
 
 
 # ============================================================
+# CLOUDINARY CONFIG
+# ============================================================
+cloudinary.config(
+    cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME", ""),
+    api_key=os.environ.get("CLOUDINARY_API_KEY", ""),
+    api_secret=os.environ.get("CLOUDINARY_API_SECRET", ""),
+)
+
+# PROFILE PICTURE UPLOAD
+# ============================================================
+@app.route("/api/profile/<int:user_id>/avatar", methods=["POST"])
+def upload_profile_avatar(user_id):
+    if not os.environ.get("CLOUDINARY_CLOUD_NAME") or not os.environ.get("CLOUDINARY_API_KEY") or not os.environ.get("CLOUDINARY_API_SECRET"):
+        return jsonify({
+            "success": False,
+            "message": "Profile image storage is not configured."
+        }), 500
+
+    if "avatar" not in request.files:
+        return jsonify({
+            "success": False,
+            "message": "No profile picture was uploaded."
+        }), 400
+
+    file = request.files["avatar"]
+
+    if not file or not file.filename:
+        return jsonify({
+            "success": False,
+            "message": "Please select a profile picture."
+        }), 400
+
+    allowed_types = {
+        "image/jpeg",
+        "image/png",
+        "image/webp"
+    }
+
+    if file.mimetype not in allowed_types:
+        return jsonify({
+            "success": False,
+            "message": "Only JPG, PNG, and WebP images are allowed."
+        }), 400
+
+    try:
+        result = cloudinary.uploader.upload(
+            file,
+            folder="vicky-earn/profiles",
+            resource_type="image",
+            transformation=[
+                {
+                    "width": 500,
+                    "height": 500,
+                    "crop": "fill",
+                    "gravity": "face"
+                }
+            ]
+        )
+
+        avatar_url = result.get("secure_url")
+
+        if not avatar_url:
+            raise RuntimeError("Cloudinary did not return an image URL.")
+
+        db = get_db()
+
+        try:
+            user = db.execute(
+                "SELECT id FROM users WHERE id = ?",
+                (user_id,)
+            ).fetchone()
+
+            if not user:
+                return jsonify({
+                    "success": False,
+                    "message": "User not found"
+                }), 404
+
+            db.execute(
+                "UPDATE users SET avatar_url = ? WHERE id = ?",
+                (avatar_url, user_id)
+            )
+            db.commit()
+
+        finally:
+            db.close()
+
+        return jsonify({
+            "success": True,
+            "avatar_url": avatar_url,
+            "message": "Profile picture updated successfully."
+        })
+
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "message": f"Profile picture upload failed: {exc}"
+        }), 500
+
+
 # PROFILE
 # ============================================================
 
@@ -1347,7 +1450,7 @@ def get_profile(user_id):
     try:
         user = db.execute(
             """
-            SELECT id, name, email, balance, currency, created_at
+            SELECT id, name, email, balance, currency, avatar_url, created_at
             FROM users
             WHERE id = ?
             """,
