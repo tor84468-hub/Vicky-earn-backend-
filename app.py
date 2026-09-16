@@ -1588,7 +1588,7 @@ def admin_login():
     try:
         admin = db.execute(
             """
-            SELECT id, name, email, password
+            SELECT id, name, email, password, avatar_url
             FROM admins
             WHERE email = ?
             """,
@@ -1637,9 +1637,112 @@ def admin_login():
             "admin": {
                 "id": admin["id"],
                 "name": admin["name"],
-                "email": admin["email"]
+                "email": admin["email"],
+                "avatar_url": admin["avatar_url"]
             }
         })
+
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/profile/avatar", methods=["POST"])
+@admin_required
+def upload_admin_profile_avatar():
+    if not os.environ.get("CLOUDINARY_CLOUD_NAME") or not os.environ.get("CLOUDINARY_API_KEY") or not os.environ.get("CLOUDINARY_API_SECRET"):
+        return jsonify({
+            "success": False,
+            "message": "Profile image storage is not configured."
+        }), 500
+
+    if "avatar" not in request.files:
+        return jsonify({
+            "success": False,
+            "message": "No profile picture was uploaded."
+        }), 400
+
+    file = request.files["avatar"]
+
+    if not file or not file.filename:
+        return jsonify({
+            "success": False,
+            "message": "Please select a profile picture."
+        }), 400
+
+    allowed_types = {
+        "image/jpeg",
+        "image/png",
+        "image/webp"
+    }
+
+    if file.mimetype not in allowed_types:
+        return jsonify({
+            "success": False,
+            "message": "Only JPG, PNG, and WebP images are allowed."
+        }), 400
+
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:].strip()
+
+    db = get_db()
+
+    try:
+        session = db.execute(
+            """
+            SELECT admin_id
+            FROM admin_sessions
+            WHERE token = ?
+            AND expires_at > CURRENT_TIMESTAMP
+            """,
+            (token,)
+        ).fetchone()
+
+        if not session:
+            return jsonify({
+                "success": False,
+                "message": "Admin authentication required"
+            }), 401
+
+        admin_id = session["admin_id"]
+
+        result = cloudinary.uploader.upload(
+            file,
+            folder="vicky-earn/admins",
+            resource_type="image",
+            transformation=[
+                {
+                    "width": 500,
+                    "height": 500,
+                    "crop": "fill",
+                    "gravity": "face"
+                }
+            ]
+        )
+
+        avatar_url = result.get("secure_url")
+
+        if not avatar_url:
+            raise RuntimeError("Cloudinary did not return an image URL.")
+
+        db.execute(
+            "UPDATE admins SET avatar_url = ? WHERE id = ?",
+            (avatar_url, admin_id)
+        )
+
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "avatar_url": avatar_url,
+            "message": "Admin profile picture updated successfully."
+        })
+
+    except Exception as exc:
+        db.rollback()
+        return jsonify({
+            "success": False,
+            "message": f"Profile picture upload failed: {exc}"
+        }), 500
 
     finally:
         db.close()

@@ -396,6 +396,13 @@ def init_db():
         # ADMIN TABLES
         # ========================================================
 
+        add_column_if_missing(
+            db,
+            "admins",
+            "avatar_url",
+            "TEXT"
+        )
+
         db.execute("""
             CREATE TABLE IF NOT EXISTS admins (
                 id BIGSERIAL PRIMARY KEY,
