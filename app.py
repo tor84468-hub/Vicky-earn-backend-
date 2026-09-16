@@ -2584,6 +2584,401 @@ def webauthn_login_verify():
         }), 401
 
 
+
+# ============================================================
+# ADMIN WEBAUTHN / FINGERPRINT LOGIN
+# ============================================================
+
+def ensure_admin_webauthn_table():
+    db = get_db()
+    try:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS admin_webauthn_credentials (
+                id BIGSERIAL PRIMARY KEY,
+                admin_id BIGINT NOT NULL,
+                credential_id TEXT UNIQUE NOT NULL,
+                public_key TEXT NOT NULL,
+                sign_count BIGINT NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        db.commit()
+    finally:
+        db.close()
+
+
+ensure_admin_webauthn_table()
+
+
+def _admin_from_session_token(token):
+    if not token:
+        return None
+
+    db = get_db()
+    try:
+        row = db.execute("""
+            SELECT a.*
+            FROM admin_sessions s
+            JOIN admins a ON a.id = s.admin_id
+            WHERE s.token = %s
+              AND s.expires_at > CURRENT_TIMESTAMP
+            LIMIT 1
+        """, (token,)).fetchone()
+        return row
+    finally:
+        db.close()
+
+
+def _admin_from_request():
+    auth = request.headers.get("Authorization", "")
+
+    if not auth.startswith("Bearer "):
+        return None
+
+    return _admin_from_session_token(
+        auth.split(" ", 1)[1].strip()
+    )
+
+
+def _admin_webauthn_save_challenge(challenge, ceremony):
+    db = get_db()
+    try:
+        db.execute("""
+            DELETE FROM webauthn_challenges
+            WHERE expires_at <= CURRENT_TIMESTAMP
+               OR ceremony = %s
+        """, (ceremony,))
+
+        db.execute("""
+            INSERT INTO webauthn_challenges
+                (user_id, challenge, ceremony, expires_at)
+            VALUES
+                (NULL, %s, %s, CURRENT_TIMESTAMP + INTERVAL '5 minutes')
+        """, (challenge, ceremony))
+
+        db.commit()
+    finally:
+        db.close()
+
+
+@app.post("/api/admin/webauthn/register/options")
+def admin_webauthn_register_options():
+    admin = _admin_from_request()
+
+    if not admin:
+        return jsonify({
+            "success": False,
+            "error": "Admin authentication required."
+        }), 401
+
+    try:
+        db = get_db()
+        try:
+            existing = db.execute("""
+                SELECT credential_id
+                FROM admin_webauthn_credentials
+                WHERE admin_id = %s
+            """, (admin["id"],)).fetchall()
+        finally:
+            db.close()
+
+        exclude_credentials = [
+            PublicKeyCredentialDescriptor(
+                id=base64url_to_bytes(row["credential_id"])
+            )
+            for row in existing
+        ]
+
+        user_handle = __import__("hashlib").sha256(
+            f"vicky-webauthn-admin:{admin['id']}".encode()
+        ).digest()
+
+        options = generate_registration_options(
+            rp_id=WEBAUTHN_RP_ID,
+            rp_name=WEBAUTHN_RP_NAME,
+            user_id=user_handle,
+            user_name=str(admin["email"]),
+            user_display_name=str(admin["name"]),
+            exclude_credentials=exclude_credentials,
+            authenticator_selection=AuthenticatorSelectionCriteria(
+                authenticator_attachment=AuthenticatorAttachment.PLATFORM,
+                resident_key=ResidentKeyRequirement.REQUIRED,
+                user_verification=UserVerificationRequirement.REQUIRED,
+            ),
+        )
+
+        challenge = bytes_to_base64url(options.challenge)
+
+        _admin_webauthn_save_challenge(
+            challenge,
+            "admin_registration"
+        )
+
+        return jsonify(json.loads(options_to_json(options)))
+
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "error": f"Admin fingerprint registration failed: {exc}"
+        }), 500
+
+
+@app.post("/api/admin/webauthn/register/verify")
+def admin_webauthn_register_verify():
+    admin = _admin_from_request()
+
+    if not admin:
+        return jsonify({
+            "success": False,
+            "error": "Admin authentication required."
+        }), 401
+
+    credential = request.get_json(silent=True) or {}
+    client_data = credential.get("response", {})
+
+    client_data_json = client_data.get("clientDataJSON")
+    attestation_object = client_data.get("attestationObject")
+
+    if not client_data_json or not attestation_object:
+        return jsonify({
+            "success": False,
+            "error": "Invalid WebAuthn response."
+        }), 400
+
+    try:
+        parsed_client = json.loads(
+            base64url_to_bytes(client_data_json).decode("utf-8")
+        )
+
+        challenge = parsed_client.get("challenge")
+
+        if not challenge:
+            raise ValueError("Missing challenge.")
+
+        stored = _webauthn_get_challenge(
+            challenge,
+            "admin_registration"
+        )
+
+        if not stored:
+            return jsonify({
+                "success": False,
+                "error": "WebAuthn challenge expired or invalid."
+            }), 400
+
+        verification = verify_registration_response(
+            credential=credential,
+            expected_challenge=base64url_to_bytes(challenge),
+            expected_rp_id=WEBAUTHN_RP_ID,
+            expected_origin=WEBAUTHN_ORIGIN,
+        )
+
+        credential_id = bytes_to_base64url(
+            verification.credential_id
+        )
+
+        public_key = bytes_to_base64url(
+            verification.credential_public_key
+        )
+
+        db = get_db()
+        try:
+            db.execute("""
+                INSERT INTO admin_webauthn_credentials
+                    (admin_id, credential_id, public_key, sign_count)
+                VALUES
+                    (%s, %s, %s, %s)
+                ON CONFLICT (credential_id)
+                DO UPDATE SET
+                    admin_id = EXCLUDED.admin_id,
+                    public_key = EXCLUDED.public_key,
+                    sign_count = EXCLUDED.sign_count,
+                    last_used_at = CURRENT_TIMESTAMP
+            """, (
+                admin["id"],
+                credential_id,
+                public_key,
+                verification.sign_count,
+            ))
+            db.commit()
+        finally:
+            db.close()
+
+        return jsonify({
+            "success": True,
+            "message": "Admin fingerprint login enabled."
+        })
+
+    except (InvalidRegistrationResponse, ValueError, KeyError, TypeError) as exc:
+        return jsonify({
+            "success": False,
+            "error": f"Admin fingerprint registration failed: {exc}"
+        }), 400
+
+
+@app.post("/api/admin/webauthn/login/options")
+def admin_webauthn_login_options():
+    try:
+        options = generate_authentication_options(
+            rp_id=WEBAUTHN_RP_ID,
+            user_verification=UserVerificationRequirement.REQUIRED,
+        )
+
+        challenge = bytes_to_base64url(options.challenge)
+
+        _admin_webauthn_save_challenge(
+            challenge,
+            "admin_authentication"
+        )
+
+        return jsonify(json.loads(options_to_json(options)))
+
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "error": f"Admin fingerprint login options failed: {exc}"
+        }), 500
+
+
+@app.post("/api/admin/webauthn/login/verify")
+def admin_webauthn_login_verify():
+    credential = request.get_json(silent=True) or {}
+
+    raw_id = credential.get("rawId")
+
+    if not raw_id:
+        return jsonify({
+            "success": False,
+            "error": "Missing credential ID."
+        }), 400
+
+    credential_id = bytes_to_base64url(
+        base64url_to_bytes(raw_id)
+    )
+
+    db = get_db()
+    try:
+        stored = db.execute("""
+            SELECT *
+            FROM admin_webauthn_credentials
+            WHERE credential_id = %s
+            LIMIT 1
+        """, (credential_id,)).fetchone()
+    finally:
+        db.close()
+
+    if not stored:
+        return jsonify({
+            "success": False,
+            "error": "Admin fingerprint is not registered on this device."
+        }), 404
+
+    client_data_json = (credential.get("response") or {}).get(
+        "clientDataJSON"
+    )
+
+    if not client_data_json:
+        return jsonify({
+            "success": False,
+            "error": "Invalid WebAuthn response."
+        }), 400
+
+    try:
+        parsed_client = json.loads(
+            base64url_to_bytes(client_data_json).decode("utf-8")
+        )
+
+        challenge = parsed_client.get("challenge")
+
+        if not challenge:
+            raise ValueError("Missing challenge.")
+
+        stored_challenge = _webauthn_get_challenge(
+            challenge,
+            "admin_authentication"
+        )
+
+        if not stored_challenge:
+            return jsonify({
+                "success": False,
+                "error": "WebAuthn challenge expired or invalid."
+            }), 400
+
+        verification = verify_authentication_response(
+            credential=credential,
+            expected_challenge=base64url_to_bytes(challenge),
+            expected_rp_id=WEBAUTHN_RP_ID,
+            expected_origin=WEBAUTHN_ORIGIN,
+            credential_public_key=base64url_to_bytes(
+                stored["public_key"]
+            ),
+            credential_current_sign_count=stored["sign_count"],
+            require_user_verification=True,
+        )
+
+        db = get_db()
+
+        try:
+            db.execute("""
+                UPDATE admin_webauthn_credentials
+                SET sign_count = %s,
+                    last_used_at = CURRENT_TIMESTAMP
+                WHERE credential_id = %s
+            """, (
+                verification.new_sign_count,
+                credential_id,
+            ))
+
+            db.commit()
+        finally:
+            db.close()
+
+        session_token = secrets.token_urlsafe(64)
+
+        db = get_db()
+
+        try:
+            db.execute("""
+                INSERT INTO admin_sessions
+                    (admin_id, token, expires_at)
+                VALUES
+                    (%s, %s, CURRENT_TIMESTAMP + INTERVAL '30 days')
+            """, (
+                stored["admin_id"],
+                session_token,
+            ))
+
+            admin = db.execute("""
+                SELECT id, name, email, avatar_url
+                FROM admins
+                WHERE id = %s
+                LIMIT 1
+            """, (stored["admin_id"],)).fetchone()
+
+            db.commit()
+        finally:
+            db.close()
+
+        if not admin:
+            return jsonify({
+                "success": False,
+                "error": "Admin account no longer exists."
+            }), 404
+
+        return jsonify({
+            "success": True,
+            "token": session_token,
+            "admin": dict(admin),
+        })
+
+    except (InvalidAuthenticationResponse, ValueError, KeyError, TypeError) as exc:
+        return jsonify({
+            "success": False,
+            "error": f"Admin fingerprint login failed: {exc}"
+        }), 401
+
+
 def ensure_env_admin():
     """
     Create or update the deployed admin account from environment variables.
