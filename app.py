@@ -1902,6 +1902,44 @@ def admin_users():
 
 
 
+
+@app.route("/api/admin/users/reset-all", methods=["POST"])
+@admin_required
+def admin_reset_all_users():
+    db = get_db()
+
+    try:
+        # Delete dependent normal-user records first.
+        db.execute("DELETE FROM transactions")
+        db.execute("DELETE FROM notifications")
+        db.execute("DELETE FROM withdrawals")
+        db.execute("DELETE FROM referrals")
+        db.execute("DELETE FROM user_sessions")
+        db.execute("DELETE FROM user_webauthn_credentials")
+        db.execute("DELETE FROM webauthn_challenges")
+
+        # Delete ONLY normal user accounts.
+        # The separate admins table is never modified.
+        result = db.execute("DELETE FROM users")
+
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "All normal user accounts have been reset",
+            "deleted_accounts": result.rowcount
+        })
+
+    except Exception as exc:
+        db.rollback()
+        return jsonify({
+            "success": False,
+            "message": f"Account reset failed: {exc}"
+        }), 500
+
+    finally:
+        db.close()
+
 @app.route("/api/admin/users/delete", methods=["POST"])
 @admin_required
 def admin_delete_user():
