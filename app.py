@@ -3495,6 +3495,45 @@ def _admin_webauthn_save_challenge(challenge, ceremony):
         db.close()
 
 
+
+
+# TEMPORARY: remove all WebAuthn credentials for the authenticated admin.
+@app.post("/api/admin/webauthn/reset-credentials")
+def admin_webauthn_reset_credentials():
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return jsonify({
+            "success": False,
+            "message": "Admin authentication required"
+        }), 401
+
+    token = auth[7:].strip()
+    admin = _admin_from_session_token(token)
+
+    if not admin:
+        return jsonify({
+            "success": False,
+            "message": "Invalid or expired admin session"
+        }), 401
+
+    db = get_db()
+    try:
+        admin_id = admin["id"] if "id" in admin.keys() else admin["admin_id"]
+
+        result = db.execute(
+            "DELETE FROM admin_webauthn_credentials WHERE admin_id = ?",
+            (admin_id,)
+        )
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "Existing admin fingerprint/passkey removed.",
+            "removed": result.rowcount
+        })
+    finally:
+        db.close()
+
 @app.post("/api/admin/webauthn/register/options")
 def admin_webauthn_register_options():
     admin = _admin_from_request()
