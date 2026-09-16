@@ -2835,18 +2835,6 @@ def delete_user_biometric(credential_id):
                 "message": "Biometric credential not found."
             }), 404
 
-        count = db.execute("""
-            SELECT COUNT(*) AS count
-            FROM user_webauthn_credentials
-            WHERE user_id = ?
-        """, (user["user_id"],)).fetchone()["count"]
-
-        if count <= 1:
-            return jsonify({
-                "success": False,
-                "message": "Keep at least one phone security credential on the account."
-            }), 400
-
         db.execute("""
             DELETE FROM user_webauthn_credentials
             WHERE id = ?
@@ -4552,3 +4540,162 @@ def production_payment_health():
             "mode": os.getenv("PAYMENT_MODE", "production"),
         },
     })
+
+
+# ============================================================
+# VICKY EARN PROFIT API
+# ============================================================
+
+@app.route("/api/admin/profit", methods=["GET"])
+@admin_required
+def admin_profit_summary():
+    db = get_db()
+    try:
+        revenue = db.execute("""
+            SELECT COALESCE(SUM(amount), 0)
+            FROM platform_revenue
+        """).fetchone()[0] or 0
+
+        expenses = db.execute("""
+            SELECT COALESCE(SUM(amount), 0)
+            FROM platform_expenses
+        """).fetchone()[0] or 0
+
+        net_profit = float(revenue) - float(expenses)
+
+        revenue_rows = db.execute("""
+            SELECT id, type, amount, currency, description, created_at
+            FROM platform_revenue
+            ORDER BY id DESC
+            LIMIT 50
+        """).fetchall()
+
+        expense_rows = db.execute("""
+            SELECT id, type, amount, currency, description, created_at
+            FROM platform_expenses
+            ORDER BY id DESC
+            LIMIT 50
+        """).fetchall()
+
+        return jsonify({
+            "success": True,
+            "profit": {
+                "revenue": float(revenue),
+                "expenses": float(expenses),
+                "net_profit": net_profit
+            },
+            "revenue_records": [dict(row) for row in revenue_rows],
+            "expense_records": [dict(row) for row in expense_rows]
+        })
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/profit/revenue", methods=["POST"])
+@admin_required
+def admin_add_profit_revenue():
+    data = request.get_json(silent=True) or {}
+
+    revenue_type = str(data.get("type", "")).strip()
+    description = str(data.get("description", "")).strip()
+    currency = str(data.get("currency", "NGN")).strip().upper()
+
+    if not revenue_type:
+        return jsonify({
+            "success": False,
+            "message": "Revenue type is required."
+        }), 400
+
+    try:
+        amount = parse_amount(data.get("amount"))
+    except Exception:
+        return jsonify({
+            "success": False,
+            "message": "Invalid revenue amount."
+        }), 400
+
+    if amount <= 0:
+        return jsonify({
+            "success": False,
+            "message": "Revenue amount must be greater than zero."
+        }), 400
+
+    db = get_db()
+    try:
+        cursor = db.execute("""
+            INSERT INTO platform_revenue
+            (type, amount, currency, description)
+            VALUES (?, ?, ?, ?)
+        """, (
+            revenue_type,
+            amount,
+            currency,
+            description
+        ))
+
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "Revenue recorded.",
+            "id": cursor.lastrowid,
+            "amount": float(amount),
+            "currency": currency
+        }), 201
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/profit/expense", methods=["POST"])
+@admin_required
+def admin_add_profit_expense():
+    data = request.get_json(silent=True) or {}
+
+    expense_type = str(data.get("type", "")).strip()
+    description = str(data.get("description", "")).strip()
+    currency = str(data.get("currency", "NGN")).strip().upper()
+
+    if not expense_type:
+        return jsonify({
+            "success": False,
+            "message": "Expense type is required."
+        }), 400
+
+    try:
+        amount = parse_amount(data.get("amount"))
+    except Exception:
+        return jsonify({
+            "success": False,
+            "message": "Invalid expense amount."
+        }), 400
+
+    if amount <= 0:
+        return jsonify({
+            "success": False,
+            "message": "Expense amount must be greater than zero."
+        }), 400
+
+    db = get_db()
+    try:
+        cursor = db.execute("""
+            INSERT INTO platform_expenses
+            (type, amount, currency, description)
+            VALUES (?, ?, ?, ?)
+        """, (
+            expense_type,
+            amount,
+            currency,
+            description
+        ))
+
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "Expense recorded.",
+            "id": cursor.lastrowid,
+            "amount": float(amount),
+            "currency": currency
+        }), 201
+    finally:
+        db.close()
