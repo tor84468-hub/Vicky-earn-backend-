@@ -1535,6 +1535,14 @@ def admin_login():
     email = str(data.get("email", "")).strip().lower()
     password = str(data.get("password", ""))
 
+    allowed_admin_email = os.environ.get("ADMIN_EMAIL", "").strip().lower()
+
+    if not allowed_admin_email or email != allowed_admin_email:
+        return jsonify({
+            "success": False,
+            "message": "This email is not authorized for the Vicky Earn Admin app."
+        }), 403
+
     if not email or not password:
         return jsonify({
             "success": False,
