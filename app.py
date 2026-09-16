@@ -1943,6 +1943,78 @@ def admin_users():
     })
 
 
+
+@app.route("/api/admin/users/delete", methods=["POST"])
+@admin_required
+def admin_delete_user():
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email", "")).strip().lower()
+
+    if not email:
+        return jsonify({
+            "success": False,
+            "message": "User email is required"
+        }), 400
+
+    db = get_db()
+
+    try:
+        user = db.execute(
+            """
+            SELECT id, name, email
+            FROM users
+            WHERE LOWER(email) = ?
+            LIMIT 1
+            """,
+            (email,)
+        ).fetchone()
+
+        if not user:
+            return jsonify({
+                "success": False,
+                "message": "User account not found"
+            }), 404
+
+        user_id = user["id"]
+
+        # Remove records that reference this user without ON DELETE CASCADE.
+        db.execute("DELETE FROM transactions WHERE user_id = ?", (user_id,))
+        db.execute("DELETE FROM notifications WHERE user_id = ?", (user_id,))
+        db.execute("DELETE FROM withdrawals WHERE user_id = ?", (user_id,))
+        db.execute(
+            "DELETE FROM referrals WHERE user_id = ? OR referred_user_id = ?",
+            (user_id, user_id)
+        )
+
+        # These tables already use ON DELETE CASCADE where present.
+        db.execute(
+            "DELETE FROM users WHERE id = ? AND LOWER(email) = ?",
+            (user_id, email)
+        )
+
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "Normal user account deleted",
+            "deleted_user": {
+                "id": user_id,
+                "name": user["name"],
+                "email": user["email"]
+            }
+        })
+
+    except Exception as exc:
+        db.rollback()
+        return jsonify({
+            "success": False,
+            "message": f"Account deletion failed: {exc}"
+        }), 500
+
+    finally:
+        db.close()
+
+
 @app.route("/api/admin/withdrawals", methods=["GET"])
 @admin_required
 def admin_withdrawals():
