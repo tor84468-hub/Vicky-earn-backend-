@@ -134,21 +134,17 @@ def register():
 
     name = str(data.get("name", "")).strip()
     email = str(data.get("email", "")).strip().lower()
-    password = str(data.get("password", ""))
-
-    if not name or not email or not password:
+    if not name or not email:
         return jsonify({
             "success": False,
-            "message": "Name, email and password are required"
+            "message": "Name and email are required"
         }), 400
 
-    if len(password) < 6:
-        return jsonify({
-            "success": False,
-            "message": "Password must be at least 6 characters"
-        }), 400
-
-    password_hash = generate_password_hash(password)
+    # The database still requires a password column for legacy compatibility,
+    # but normal users never receive or use this generated value for login.
+    password_hash = generate_password_hash(
+        secrets.token_urlsafe(32)
+    )
 
     try:
         with transaction() as db:
@@ -176,9 +172,14 @@ def register():
 
             user_id = cursor.lastrowid
 
+        # Create the initial session only so the new account can
+        # register its phone security credential immediately.
+        session_token = create_user_session(user_id)
+
         return jsonify({
             "success": True,
             "message": "Account created successfully",
+            "session_token": session_token,
             "user": {
                 "id": user_id,
                 "name": name,
@@ -238,53 +239,10 @@ def create_user_session(user_id):
 
 @app.route("/api/auth/login", methods=["POST"])
 def login():
-    data = request.get_json(silent=True) or {}
-
-    email = str(data.get("email", "")).strip().lower()
-    password = str(data.get("password", ""))
-
-    if not email or not password:
-        return jsonify({
-            "success": False,
-            "message": "Email and password are required"
-        }), 400
-
-    db = get_db()
-
-    try:
-        user = db.execute(
-            """
-            SELECT id, name, email, password, balance, currency, account_id
-            FROM users
-            WHERE email = ?
-            """,
-            (email,)
-        ).fetchone()
-    finally:
-        db.close()
-
-    if not user or not check_password_hash(user["password"], password):
-        return jsonify({
-            "success": False,
-            "message": "Invalid email or password"
-        }), 401
-
-    # Create a long-lived server-side session for this device.
-    session_token = create_user_session(user["id"])
-
     return jsonify({
-        "success": True,
-        "message": "Login successful",
-        "session_token": session_token,
-        "user": {
-            "id": user["id"],
-            "name": user["name"],
-            "email": user["email"],
-            "balance": user["balance"],
-            "currency": user["currency"],
-            "account_id": user["account_id"]
-        }
-    })
+        "success": False,
+        "message": "Password login is disabled. Use your phone fingerprint, face unlock, or secure phone PIN."
+    }), 410
 
 
 @app.route("/api/auth/session", methods=["GET"])
