@@ -2134,7 +2134,194 @@ def stats():
 # ADMIN DATABASE TABLES
 # ============================================================
 
-def ensure_admin_tables():
+def ensure_admin_tables()
+
+
+# ============================================================
+# VICKY EARN PROFIT ENGINE
+# ============================================================
+
+def ensure_profit_tables():
+    db = get_db()
+    try:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS platform_expenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                amount REAL NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'NGN',
+                description TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS revenue_sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                provider TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        db.commit()
+    finally:
+        db.close()
+
+
+ensure_profit_tables()
+
+
+def _profit_summary(currency=None):
+    db = get_db()
+    try:
+        revenue_sql = """
+            SELECT COALESCE(SUM(amount), 0) AS total
+            FROM platform_revenue
+        """
+        expense_sql = """
+            SELECT COALESCE(SUM(amount), 0) AS total
+            FROM platform_expenses
+        """
+
+        params = ()
+        if currency:
+            revenue_sql += " WHERE currency = ?"
+            expense_sql += " WHERE currency = ?"
+            params = (currency,)
+
+        revenue = float(db.execute(revenue_sql, params).fetchone()["total"] or 0)
+        expenses = float(db.execute(expense_sql, params).fetchone()["total"] or 0)
+
+        # User balances represent outstanding user liabilities,
+        # not platform revenue.
+        balance_sql = """
+            SELECT COALESCE(SUM(balance), 0) AS total
+            FROM users
+        """
+        balance_params = ()
+        if currency:
+            balance_sql += " WHERE currency = ?"
+            balance_params = (currency,)
+
+        user_liability = float(
+            db.execute(balance_sql, balance_params).fetchone()["total"] or 0
+        )
+
+        return {
+            "revenue": revenue,
+            "expenses": expenses,
+            "user_balance_liability": user_liability,
+            "net_platform_result": revenue - expenses
+        }
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/profit", methods=["GET"])
+@admin_required
+def admin_profit():
+    currency = (request.args.get("currency") or "").strip().upper() or None
+
+    db = get_db()
+    try:
+        summary = _profit_summary(currency)
+
+        revenue_rows = db.execute("""
+            SELECT id, type, amount, currency, description, created_at
+            FROM platform_revenue
+            ORDER BY id DESC
+            LIMIT 100
+        """).fetchall()
+
+        expense_rows = db.execute("""
+            SELECT id, type, amount, currency, description, created_at
+            FROM platform_expenses
+            ORDER BY id DESC
+            LIMIT 100
+        """).fetchall()
+
+        return jsonify({
+            "success": True,
+            "summary": summary,
+            "revenue": [dict(row) for row in revenue_rows],
+            "expenses": [dict(row) for row in expense_rows]
+        })
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/profit/revenue", methods=["POST"])
+@admin_required
+def admin_add_revenue():
+    data = request.get_json(silent=True) or {}
+
+    revenue_type = str(data.get("type") or "").strip()
+    amount = parse_amount(data.get("amount"))
+    currency = str(data.get("currency") or "NGN").strip().upper()
+    description = str(data.get("description") or "").strip()
+
+    if not revenue_type or amount is None or amount <= 0:
+        return jsonify({
+            "success": False,
+            "message": "Valid revenue type and positive amount are required"
+        }), 400
+
+    db = get_db()
+    try:
+        cursor = db.execute("""
+            INSERT INTO platform_revenue
+            (type, amount, currency, description)
+            VALUES (?, ?, ?, ?)
+        """, (revenue_type, amount, currency, description or None))
+
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "revenue_id": cursor.lastrowid,
+            "message": "Platform revenue recorded"
+        }), 201
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/profit/expense", methods=["POST"])
+@admin_required
+def admin_add_expense():
+    data = request.get_json(silent=True) or {}
+
+    expense_type = str(data.get("type") or "").strip()
+    amount = parse_amount(data.get("amount"))
+    currency = str(data.get("currency") or "NGN").strip().upper()
+    description = str(data.get("description") or "").strip()
+
+    if not expense_type or amount is None or amount <= 0:
+        return jsonify({
+            "success": False,
+            "message": "Valid expense type and positive amount are required"
+        }), 400
+
+    db = get_db()
+    try:
+        cursor = db.execute("""
+            INSERT INTO platform_expenses
+            (type, amount, currency, description)
+            VALUES (?, ?, ?, ?)
+        """, (expense_type, amount, currency, description or None))
+
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "expense_id": cursor.lastrowid,
+            "message": "Platform expense recorded"
+        }), 201
+    finally:
+        db.close()
+
+:
     db = get_db()
     try:
         db.execute("""
