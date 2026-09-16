@@ -39,6 +39,9 @@ from webauthn_config import (
     WEBAUTHN_RP_ID,
     WEBAUTHN_RP_NAME,
     WEBAUTHN_ORIGIN,
+    ADMIN_WEBAUTHN_RP_ID,
+    ADMIN_WEBAUTHN_RP_NAME,
+    ADMIN_WEBAUTHN_ORIGIN,
 )
 
 app = Flask(__name__)
@@ -3575,8 +3578,8 @@ def admin_webauthn_register_options():
         ).digest()
 
         options = generate_registration_options(
-            rp_id=WEBAUTHN_RP_ID,
-            rp_name=WEBAUTHN_RP_NAME,
+            rp_id=ADMIN_WEBAUTHN_RP_ID,
+            rp_name=ADMIN_WEBAUTHN_RP_NAME,
             user_id=user_handle,
             user_name=str(admin["email"]),
             user_display_name=str(admin["name"]),
@@ -3650,8 +3653,8 @@ def admin_webauthn_register_verify():
         verification = verify_registration_response(
             credential=credential,
             expected_challenge=base64url_to_bytes(challenge),
-            expected_rp_id=WEBAUTHN_RP_ID,
-            expected_origin=WEBAUTHN_ORIGIN,
+            expected_rp_id=ADMIN_WEBAUTHN_RP_ID,
+            expected_origin=ADMIN_WEBAUTHN_ORIGIN,
         )
 
         credential_id = bytes_to_base64url(
@@ -3701,7 +3704,7 @@ def admin_webauthn_register_verify():
 def admin_webauthn_login_options():
     try:
         options = generate_authentication_options(
-            rp_id=WEBAUTHN_RP_ID,
+            rp_id=ADMIN_WEBAUTHN_RP_ID,
             user_verification=UserVerificationRequirement.REQUIRED,
         )
 
@@ -3788,8 +3791,8 @@ def admin_webauthn_login_verify():
         verification = verify_authentication_response(
             credential=credential,
             expected_challenge=base64url_to_bytes(challenge),
-            expected_rp_id=WEBAUTHN_RP_ID,
-            expected_origin=WEBAUTHN_ORIGIN,
+            expected_rp_id=ADMIN_WEBAUTHN_RP_ID,
+            expected_origin=ADMIN_WEBAUTHN_ORIGIN,
             credential_public_key=base64url_to_bytes(
                 stored["public_key"]
             ),
