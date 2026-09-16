@@ -2252,6 +2252,771 @@ def ensure_webauthn_challenge_table():
 ensure_webauthn_challenge_table()
 
 
+# ============================================================
+# USER SECURITY / NOTIFICATION TABLES
+# ============================================================
+
+def ensure_user_security_tables():
+    db = get_db()
+    try:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS user_security_events (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                event_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                message TEXT NOT NULL,
+                metadata TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS user_notification_preferences (
+                user_id BIGINT PRIMARY KEY,
+                security_alerts INTEGER NOT NULL DEFAULT 1,
+                earning_alerts INTEGER NOT NULL DEFAULT 1,
+                transaction_alerts INTEGER NOT NULL DEFAULT 1,
+                account_alerts INTEGER NOT NULL DEFAULT 1,
+                push_enabled INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS user_push_subscriptions (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                endpoint TEXT UNIQUE NOT NULL,
+                p256dh TEXT NOT NULL,
+                auth TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+
+        db.execute("""
+            ALTER TABLE user_sessions
+            ADD COLUMN IF NOT EXISTS device_name TEXT
+        """)
+
+        db.execute("""
+            ALTER TABLE user_sessions
+            ADD COLUMN IF NOT EXISTS user_agent TEXT
+        """)
+
+        db.execute("""
+            ALTER TABLE user_sessions
+            ADD COLUMN IF NOT EXISTS ip_address TEXT
+        """)
+
+        db.commit()
+    finally:
+        db.close()
+
+
+ensure_user_security_tables()
+
+
+def current_user_from_request():
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None, None
+
+    token = auth[7:].strip()
+    if not token:
+        return None, None
+
+    db = get_db()
+    try:
+        row = db.execute("""
+            SELECT
+                s.id AS session_id,
+                s.user_id,
+                s.token,
+                u.id,
+                u.name,
+                u.email,
+                u.balance,
+                u.currency,
+                u.account_id,
+                u.avatar_url
+            FROM user_sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.token = ?
+              AND s.expires_at > CURRENT_TIMESTAMP
+            LIMIT 1
+        """, (token,)).fetchone()
+
+        if not row:
+            return None, None
+
+        db.execute("""
+            UPDATE user_sessions
+            SET last_used_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (row["session_id"],))
+        db.commit()
+
+        return dict(row), token
+    finally:
+        db.close()
+
+
+def log_user_security_event(
+    user_id,
+    event_type,
+    title,
+    message,
+    metadata=None,
+    create_notification=True
+):
+    db = get_db()
+    try:
+        db.execute("""
+            INSERT INTO user_security_events
+            (user_id, event_type, title, message, metadata)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            user_id,
+            event_type,
+            title,
+            message,
+            json.dumps(metadata or {})
+        ))
+
+        if create_notification:
+            db.execute("""
+                INSERT INTO notifications
+                (user_id, title, message)
+                VALUES (?, ?, ?)
+            """, (
+                user_id,
+                title,
+                message
+            ))
+
+        db.commit()
+    finally:
+        db.close()
+
+
+def send_user_push_notifications(user_id, title, message, data=None):
+    """
+    Sends Web Push notifications when VAPID credentials are configured.
+    Push failures never break the main financial/security transaction.
+    """
+    try:
+        from pywebpush import webpush, WebPushException
+    except Exception:
+        return
+
+    vapid_private_key = os.environ.get("VAPID_PRIVATE_KEY", "").strip()
+    vapid_subject = os.environ.get(
+        "VAPID_SUBJECT",
+        "mailto:admin@vicky-earn.com"
+    ).strip()
+
+    if not vapid_private_key:
+        return
+
+    db = get_db()
+    try:
+        subscriptions = db.execute("""
+            SELECT id, endpoint, p256dh, auth
+            FROM user_push_subscriptions
+            WHERE user_id = ?
+        """, (user_id,)).fetchall()
+
+        for sub in subscriptions:
+            subscription_info = {
+                "endpoint": sub["endpoint"],
+                "keys": {
+                    "p256dh": sub["p256dh"],
+                    "auth": sub["auth"],
+                }
+            }
+
+            payload = json.dumps({
+                "title": title,
+                "body": message,
+                "data": data or {}
+            })
+
+            try:
+                webpush(
+                    subscription_info=subscription_info,
+                    data=payload,
+                    vapid_private_key=vapid_private_key,
+                    vapid_claims={"sub": vapid_subject},
+                )
+
+                db.execute("""
+                    UPDATE user_push_subscriptions
+                    SET last_used_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (sub["id"],))
+
+            except Exception:
+                # Invalid subscriptions are removed.
+                try:
+                    db.execute("""
+                        DELETE FROM user_push_subscriptions
+                        WHERE id = ?
+                    """, (sub["id"],))
+                except Exception:
+                    pass
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        app.logger.exception("Push notification delivery failed")
+    finally:
+        db.close()
+
+
+def notify_user(
+    user_id,
+    title,
+    message,
+    event_type="general",
+    metadata=None,
+    push=True
+):
+    try:
+        log_user_security_event(
+            user_id,
+            event_type,
+            title,
+            message,
+            metadata,
+            create_notification=True
+        )
+    except Exception:
+        app.logger.exception("User notification creation failed")
+
+    if push:
+        try:
+            send_user_push_notifications(
+                user_id,
+                title,
+                message,
+                metadata
+            )
+        except Exception:
+            app.logger.exception("User push notification failed")
+
+
+# ============================================================
+# USER SETTINGS / SECURITY API
+# ============================================================
+
+@app.get("/api/settings")
+def get_user_settings():
+    user, token = current_user_from_request()
+
+    if not user:
+        return jsonify({
+            "success": False,
+            "message": "Authentication required"
+        }), 401
+
+    db = get_db()
+    try:
+        preferences = db.execute("""
+            SELECT
+                security_alerts,
+                earning_alerts,
+                transaction_alerts,
+                account_alerts,
+                push_enabled
+            FROM user_notification_preferences
+            WHERE user_id = ?
+        """, (user["user_id"],)).fetchone()
+
+        if not preferences:
+            db.execute("""
+                INSERT INTO user_notification_preferences
+                (user_id)
+                VALUES (?)
+            """, (user["user_id"],))
+            db.commit()
+
+            preferences = db.execute("""
+                SELECT
+                    security_alerts,
+                    earning_alerts,
+                    transaction_alerts,
+                    account_alerts,
+                    push_enabled
+                FROM user_notification_preferences
+                WHERE user_id = ?
+            """, (user["user_id"],)).fetchone()
+
+        credentials = db.execute("""
+            SELECT
+                id,
+                device_name,
+                created_at,
+                last_used_at
+            FROM user_webauthn_credentials
+            WHERE user_id = ?
+            ORDER BY id DESC
+        """, (user["user_id"],)).fetchall()
+
+        sessions = db.execute("""
+            SELECT
+                id,
+                device_name,
+                user_agent,
+                created_at,
+                last_used_at,
+                expires_at,
+                token
+            FROM user_sessions
+            WHERE user_id = ?
+            ORDER BY last_used_at DESC
+        """, (user["user_id"],)).fetchall()
+
+        safe_sessions = []
+        for row in sessions:
+            item = dict(row)
+            item.pop("token", None)
+            item["current"] = row["token"] == token
+            safe_sessions.append(item)
+
+        return jsonify({
+            "success": True,
+            "user": user,
+            "preferences": dict(preferences),
+            "biometrics": [dict(row) for row in credentials],
+            "sessions": safe_sessions
+        })
+    finally:
+        db.close()
+
+
+@app.post("/api/settings/password")
+def change_user_password():
+    user, token = current_user_from_request()
+
+    if not user:
+        return jsonify({
+            "success": False,
+            "message": "Authentication required"
+        }), 401
+
+    data = request.get_json(silent=True) or {}
+
+    current_password = str(data.get("current_password", ""))
+    new_password = str(data.get("new_password", ""))
+    confirm_password = str(data.get("confirm_password", ""))
+
+    if len(new_password) < 8:
+        return jsonify({
+            "success": False,
+            "message": "New password must be at least 8 characters."
+        }), 400
+
+    if new_password != confirm_password:
+        return jsonify({
+            "success": False,
+            "message": "New passwords do not match."
+        }), 400
+
+    db = get_db()
+    try:
+        stored = db.execute("""
+            SELECT password
+            FROM users
+            WHERE id = ?
+        """, (user["user_id"],)).fetchone()
+
+        # Existing password is optional because normal Vicky Earn
+        # login remains phone-security/WebAuthn based.
+        if stored and stored["password"]:
+            if current_password and not check_password_hash(
+                stored["password"],
+                current_password
+            ):
+                return jsonify({
+                    "success": False,
+                    "message": "Current password is incorrect."
+                }), 400
+
+        new_hash = generate_password_hash(new_password)
+
+        db.execute("""
+            UPDATE users
+            SET password = ?
+            WHERE id = ?
+        """, (new_hash, user["user_id"]))
+
+        db.commit()
+
+        log_user_security_event(
+            user["user_id"],
+            "password_changed",
+            "Account password was set or changed."
+        )
+
+        return jsonify({
+            "success": True,
+            "message": "Password saved successfully."
+        })
+
+    finally:
+        db.close()
+
+@app.post("/api/settings/preferences")
+def update_user_preferences():
+    user, token = current_user_from_request()
+
+    if not user:
+        return jsonify({
+            "success": False,
+            "message": "Authentication required"
+        }), 401
+
+    data = request.get_json(silent=True) or {}
+
+    fields = {
+        "security_alerts": int(bool(data.get("security_alerts", True))),
+        "earning_alerts": int(bool(data.get("earning_alerts", True))),
+        "transaction_alerts": int(bool(data.get("transaction_alerts", True))),
+        "account_alerts": int(bool(data.get("account_alerts", True))),
+        "push_enabled": int(bool(data.get("push_enabled", False))),
+    }
+
+    db = get_db()
+    try:
+        db.execute("""
+            INSERT INTO user_notification_preferences
+            (user_id, security_alerts, earning_alerts,
+             transaction_alerts, account_alerts, push_enabled,
+             updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (user_id)
+            DO UPDATE SET
+                security_alerts = EXCLUDED.security_alerts,
+                earning_alerts = EXCLUDED.earning_alerts,
+                transaction_alerts = EXCLUDED.transaction_alerts,
+                account_alerts = EXCLUDED.account_alerts,
+                push_enabled = EXCLUDED.push_enabled,
+                updated_at = CURRENT_TIMESTAMP
+        """, (
+            user["user_id"],
+            fields["security_alerts"],
+            fields["earning_alerts"],
+            fields["transaction_alerts"],
+            fields["account_alerts"],
+            fields["push_enabled"],
+        ))
+
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "Notification preferences updated.",
+            "preferences": fields
+        })
+    finally:
+        db.close()
+
+
+@app.get("/api/settings/security-events")
+def get_security_events():
+    user, token = current_user_from_request()
+
+    if not user:
+        return jsonify({
+            "success": False,
+            "message": "Authentication required"
+        }), 401
+
+    db = get_db()
+    try:
+        rows = db.execute("""
+            SELECT
+                id,
+                event_type,
+                title,
+                message,
+                metadata,
+                created_at
+            FROM user_security_events
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT 100
+        """, (user["user_id"],)).fetchall()
+
+        return jsonify({
+            "success": True,
+            "events": [dict(row) for row in rows]
+        })
+    finally:
+        db.close()
+
+
+@app.delete("/api/settings/biometrics/<int:credential_id>")
+def delete_user_biometric(credential_id):
+    user, token = current_user_from_request()
+
+    if not user:
+        return jsonify({
+            "success": False,
+            "message": "Authentication required"
+        }), 401
+
+    db = get_db()
+    try:
+        credential = db.execute("""
+            SELECT id, device_name
+            FROM user_webauthn_credentials
+            WHERE id = ?
+              AND user_id = ?
+        """, (credential_id, user["user_id"])).fetchone()
+
+        if not credential:
+            return jsonify({
+                "success": False,
+                "message": "Biometric credential not found."
+            }), 404
+
+        count = db.execute("""
+            SELECT COUNT(*) AS count
+            FROM user_webauthn_credentials
+            WHERE user_id = ?
+        """, (user["user_id"],)).fetchone()["count"]
+
+        if count <= 1:
+            return jsonify({
+                "success": False,
+                "message": "Keep at least one phone security credential on the account."
+            }), 400
+
+        db.execute("""
+            DELETE FROM user_webauthn_credentials
+            WHERE id = ?
+              AND user_id = ?
+        """, (credential_id, user["user_id"]))
+
+        db.commit()
+
+        notify_user(
+            user["user_id"],
+            "Phone security removed",
+            "A phone security credential was removed from your Vicky Earn account.",
+            "biometric_removed",
+            {"credential_id": credential_id}
+        )
+
+        return jsonify({
+            "success": True,
+            "message": "Phone security credential removed."
+        })
+    finally:
+        db.close()
+
+
+@app.delete("/api/settings/sessions/<int:session_id>")
+def revoke_user_session(session_id):
+    user, token = current_user_from_request()
+
+    if not user:
+        return jsonify({
+            "success": False,
+            "message": "Authentication required"
+        }), 401
+
+    db = get_db()
+    try:
+        session = db.execute("""
+            SELECT id, token
+            FROM user_sessions
+            WHERE id = ?
+              AND user_id = ?
+        """, (session_id, user["user_id"])).fetchone()
+
+        if not session:
+            return jsonify({
+                "success": False,
+                "message": "Session not found."
+            }), 404
+
+        if session["token"] == token:
+            return jsonify({
+                "success": False,
+                "message": "The current device cannot be revoked here."
+            }), 400
+
+        db.execute("""
+            DELETE FROM user_sessions
+            WHERE id = ?
+              AND user_id = ?
+        """, (session_id, user["user_id"]))
+
+        db.commit()
+
+        notify_user(
+            user["user_id"],
+            "Device signed out",
+            "Another Vicky Earn device session was signed out.",
+            "device_signed_out",
+            {"session_id": session_id}
+        )
+
+        return jsonify({
+            "success": True,
+            "message": "Device signed out successfully."
+        })
+    finally:
+        db.close()
+
+
+@app.post("/api/settings/sessions/revoke-others")
+def revoke_other_user_sessions():
+    user, token = current_user_from_request()
+
+    if not user:
+        return jsonify({
+            "success": False,
+            "message": "Authentication required"
+        }), 401
+
+    db = get_db()
+    try:
+        cursor = db.execute("""
+            DELETE FROM user_sessions
+            WHERE user_id = ?
+              AND token <> ?
+        """, (user["user_id"], token))
+
+        db.commit()
+
+        notify_user(
+            user["user_id"],
+            "Other devices signed out",
+            "All other Vicky Earn device sessions were signed out.",
+            "devices_signed_out",
+            {"count": cursor.rowcount}
+        )
+
+        return jsonify({
+            "success": True,
+            "message": "All other devices have been signed out.",
+            "count": cursor.rowcount
+        })
+    finally:
+        db.close()
+
+
+@app.post("/api/settings/push/subscribe")
+def save_push_subscription():
+    user, token = current_user_from_request()
+
+    if not user:
+        return jsonify({
+            "success": False,
+            "message": "Authentication required"
+        }), 401
+
+    data = request.get_json(silent=True) or {}
+    subscription = data.get("subscription") or {}
+
+    endpoint = str(subscription.get("endpoint", "")).strip()
+    keys = subscription.get("keys") or {}
+    p256dh = str(keys.get("p256dh", "")).strip()
+    auth_key = str(keys.get("auth", "")).strip()
+
+    if not endpoint or not p256dh or not auth_key:
+        return jsonify({
+            "success": False,
+            "message": "Invalid push subscription."
+        }), 400
+
+    db = get_db()
+    try:
+        db.execute("""
+            INSERT INTO user_push_subscriptions
+            (user_id, endpoint, p256dh, auth)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (endpoint)
+            DO UPDATE SET
+                user_id = EXCLUDED.user_id,
+                p256dh = EXCLUDED.p256dh,
+                auth = EXCLUDED.auth,
+                last_used_at = CURRENT_TIMESTAMP
+        """, (
+            user["user_id"],
+            endpoint,
+            p256dh,
+            auth_key
+        ))
+
+        db.execute("""
+            INSERT INTO user_notification_preferences
+            (user_id, push_enabled)
+            VALUES (?, 1)
+            ON CONFLICT (user_id)
+            DO UPDATE SET
+                push_enabled = 1,
+                updated_at = CURRENT_TIMESTAMP
+        """, (user["user_id"],))
+
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "Phone notifications enabled."
+        })
+    finally:
+        db.close()
+
+
+@app.delete("/api/settings/push/subscribe")
+def remove_push_subscription():
+    user, token = current_user_from_request()
+
+    if not user:
+        return jsonify({
+            "success": False,
+            "message": "Authentication required"
+        }), 401
+
+    data = request.get_json(silent=True) or {}
+    endpoint = str(data.get("endpoint", "")).strip()
+
+    db = get_db()
+    try:
+        db.execute("""
+            DELETE FROM user_push_subscriptions
+            WHERE user_id = ?
+              AND endpoint = ?
+        """, (user["user_id"], endpoint))
+
+        db.execute("""
+            UPDATE user_notification_preferences
+            SET push_enabled = 0,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ?
+        """, (user["user_id"],))
+
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "Phone notifications disabled."
+        })
+    finally:
+        db.close()
+
+
+
 
 
 # ============================================================

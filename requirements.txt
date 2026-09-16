@@ -6,3 +6,4 @@ requests>=2.31.0
 
 webauthn==2.7.0
 cloudinary==1.46.2
+pywebpush>=2.0.0
