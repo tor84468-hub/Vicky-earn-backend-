@@ -5329,13 +5329,15 @@ def ensure_virtual_accounts_table(db):
 
 @app.route("/api/payments/funding-account", methods=["GET"])
 def get_funding_account():
-    user_id = request.args.get("user_id", type=int)
+    current_user, token = current_user_from_request()
 
-    if not user_id:
+    if not current_user:
         return jsonify({
             "success": False,
-            "message": "User ID is required"
-        }), 400
+            "message": "Authentication required"
+        }), 401
+
+    user_id = current_user["user_id"]
 
     db = get_db()
 
