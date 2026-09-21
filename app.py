@@ -45,6 +45,29 @@ from webauthn_config import (
     ADMIN_WEBAUTHN_ORIGIN,
 )
 
+import hashlib
+import hmac
+
+def verify_paystack_signature(raw_body):
+    secret_key = os.getenv("PAYSTACK_SECRET_KEY")
+
+    if not secret_key:
+        return False
+
+    signature = request.headers.get("x-paystack-signature", "")
+
+    if not signature:
+        return False
+
+    expected = hmac.new(
+        secret_key.encode("utf-8"),
+        raw_body,
+        hashlib.sha512
+    ).hexdigest()
+
+    return hmac.compare_digest(signature, expected)
+
+
 app = Flask(__name__)
 CORS(
     app,
@@ -4835,19 +4858,123 @@ def production_withdraw():
 
 @app.route("/api/payments/webhook/paystack", methods=["POST"])
 def paystack_webhook():
-    payload = request.get_json(silent=True) or {}
-    event = payload.get("event")
-    payment = payload.get("data") or {}
-
-    if event != "charge.success":
-        return jsonify({"success": True})
-
-    reference = payment.get("reference")
-
-    if not reference:
-        return jsonify({"success": True})
-
     try:
+        raw_body = request.get_data()
+
+        if not verify_paystack_signature(raw_body):
+            return jsonify({
+                "success": False,
+                "message": "Invalid Paystack signature"
+            }), 401
+
+        payload = request.get_json(silent=True) or {}
+        event = payload.get("event")
+        payment = payload.get("data") or {}
+
+        # DVA assignment is asynchronous. Store the actual account
+        # when Paystack confirms that assignment completed.
+        if event == "dedicatedaccount.assign.success":
+            customer = payment.get("customer") or {}
+            dedicated = payment.get("dedicated_account") or payment
+
+            email = (
+                customer.get("email")
+                or payment.get("email")
+            )
+
+            account_number = (
+                dedicated.get("account_number")
+                or payment.get("account_number")
+            )
+
+            account_name = (
+                dedicated.get("account_name")
+                or payment.get("account_name")
+            )
+
+            bank = dedicated.get("bank") or payment.get("bank") or {}
+            bank_name = (
+                bank.get("name")
+                if isinstance(bank, dict)
+                else dedicated.get("bank_name")
+            )
+
+            customer_code = (
+                customer.get("customer_code")
+                or payment.get("customer_code")
+            )
+
+            if not account_number:
+                return jsonify({"success": True})
+
+            with transaction() as db:
+                user = None
+
+                if email:
+                    user = db.execute("""
+                        SELECT id
+                        FROM users
+                        WHERE LOWER(email) = LOWER(?)
+                        LIMIT 1
+                    """, (email,)).fetchone()
+
+                if not user and customer_code:
+                    existing = db.execute("""
+                        SELECT user_id
+                        FROM virtual_accounts
+                        WHERE provider = 'paystack'
+                          AND provider_reference = ?
+                        LIMIT 1
+                    """, (str(customer_code),)).fetchone()
+
+                    if existing:
+                        user = {"id": existing["user_id"]}
+
+                if not user:
+                    return jsonify({"success": True})
+
+                db.execute("""
+                    INSERT INTO virtual_accounts
+                    (
+                        user_id,
+                        provider,
+                        account_number,
+                        account_name,
+                        bank_name,
+                        provider_reference,
+                        status,
+                        metadata,
+                        updated_at
+                    )
+                    VALUES (?, 'paystack', ?, ?, ?, ?, 'active', ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT (provider, user_id)
+                    DO UPDATE SET
+                        account_number = EXCLUDED.account_number,
+                        account_name = EXCLUDED.account_name,
+                        bank_name = EXCLUDED.bank_name,
+                        provider_reference = EXCLUDED.provider_reference,
+                        status = 'active',
+                        metadata = EXCLUDED.metadata,
+                        updated_at = CURRENT_TIMESTAMP
+                """, (
+                    user["id"],
+                    account_number,
+                    account_name,
+                    bank_name,
+                    str(customer_code) if customer_code else None,
+                    json.dumps(payment)
+                ))
+
+            return jsonify({"success": True})
+
+        if event != "charge.success":
+            return jsonify({"success": True})
+
+        reference = payment.get("reference")
+
+        if not reference:
+            return jsonify({"success": True})
+
         result = paystack_verify(reference)
 
         if not result.get("status"):
@@ -4860,6 +4987,31 @@ def paystack_webhook():
 
         metadata = verified.get("metadata") or {}
         user_id = metadata.get("user_id")
+
+        # DVA transfers may not contain our normal checkout metadata.
+        # Identify the Vicky Earn user from the receiving account number.
+        if not user_id:
+            authorization = verified.get("authorization") or {}
+            receiver_account = (
+                authorization.get("receiver_bank_account_number")
+                or payment.get("authorization", {}).get(
+                    "receiver_bank_account_number"
+                )
+            )
+
+            if receiver_account:
+                with transaction() as lookup_db:
+                    virtual = lookup_db.execute("""
+                        SELECT user_id
+                        FROM virtual_accounts
+                        WHERE provider = 'paystack'
+                          AND account_number = ?
+                          AND status = 'active'
+                        LIMIT 1
+                    """, (str(receiver_account),)).fetchone()
+
+                    if virtual:
+                        user_id = virtual["user_id"]
 
         if not user_id:
             return jsonify({"success": True})
@@ -4879,58 +5031,46 @@ def paystack_webhook():
         idempotency_key = f"paystack-deposit-{reference}"
 
         with transaction() as db:
-            user = db.execute(
-                """
+            user = db.execute("""
                 SELECT id
                 FROM users
                 WHERE id = ?
-                """,
-                (user_id,),
-            ).fetchone()
+            """, (user_id,)).fetchone()
 
             if not user:
                 return jsonify({"success": True})
 
-            # Check the payment ledger first.
-            existing_payment = db.execute(
-                """
+            existing_payment = db.execute("""
                 SELECT id, status
                 FROM payment_transactions
                 WHERE provider = 'paystack'
                   AND provider_reference = ?
                 LIMIT 1
-                """,
-                (reference,),
-            ).fetchone()
+            """, (reference,)).fetchone()
 
             if existing_payment and existing_payment["status"] == "success":
                 return jsonify({"success": True})
 
-            # Credit the wallet ledger exactly once.
             ledger_tx = credit_wallet(
                 db,
                 user_id=user_id,
                 currency=currency,
                 amount=amount,
                 transaction_type="deposit",
-                description=f"Verified Paystack webhook deposit {reference}",
+                description=f"Verified Paystack deposit {reference}",
                 reference=ledger_reference,
                 idempotency_key=idempotency_key,
             )
 
-            # Keep legacy balance synchronized during migration.
-            db.execute(
-                """
+            # Legacy compatibility mirror.
+            db.execute("""
                 UPDATE users
                 SET balance = balance + ?
                 WHERE id = ?
-                """,
-                (amount, user_id),
-            )
+            """, (amount, user_id))
 
             if existing_payment:
-                db.execute(
-                    """
+                db.execute("""
                     UPDATE payment_transactions
                     SET status = 'success',
                         amount = ?,
@@ -4939,18 +5079,15 @@ def paystack_webhook():
                         metadata = ?,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
-                    """,
-                    (
-                        amount,
-                        currency,
-                        ledger_tx["id"],
-                        json.dumps(verified),
-                        existing_payment["id"],
-                    ),
-                )
+                """, (
+                    amount,
+                    currency,
+                    ledger_tx["id"],
+                    json.dumps(verified),
+                    existing_payment["id"],
+                ))
             else:
-                db.execute(
-                    """
+                db.execute("""
                     INSERT INTO payment_transactions
                     (
                         user_id,
@@ -4969,37 +5106,29 @@ def paystack_webhook():
                         ?, 'paystack', ?, 'deposit', ?, ?, 'success',
                         ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                     )
-                    """,
-                    (
-                        user_id,
-                        reference,
-                        amount,
-                        currency,
-                        ledger_tx["id"],
-                        json.dumps(verified),
-                    ),
-                )
+                """, (
+                    user_id,
+                    reference,
+                    amount,
+                    currency,
+                    ledger_tx["id"],
+                    json.dumps(verified),
+                ))
 
-            db.execute(
-                """
+            db.execute("""
                 INSERT INTO transactions
                 (user_id, type, amount, currency, description, created_at)
                 VALUES (?, 'deposit', ?, ?, ?, CURRENT_TIMESTAMP)
-                """,
-                (
-                    user_id,
-                    amount,
-                    currency,
-                    f"Verified provider deposit {reference}",
-                ),
-            )
+            """, (
+                user_id,
+                amount,
+                currency,
+                f"Verified provider deposit {reference}",
+            ))
 
         return jsonify({"success": True})
 
     except Exception:
-        # Payment providers expect a successful webhook response.
-        # The verification endpoint remains the authoritative
-        # recovery path if processing fails.
         return jsonify({"success": True})
 
 
