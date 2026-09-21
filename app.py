@@ -4642,7 +4642,6 @@ def production_withdraw():
 @app.route("/api/payments/webhook/paystack", methods=["POST"])
 def paystack_webhook():
     payload = request.get_json(silent=True) or {}
-
     event = payload.get("event")
     payment = payload.get("data") or {}
 
@@ -4679,21 +4678,53 @@ def paystack_webhook():
             verified.get("currency", "NGN")
         ).upper()
 
-        with transaction() as db:
+        if amount <= 0:
+            return jsonify({"success": True})
 
-            duplicate = db.execute(
+        ledger_reference = f"PAYSTACK-{reference}"
+        idempotency_key = f"paystack-deposit-{reference}"
+
+        with transaction() as db:
+            user = db.execute(
                 """
                 SELECT id
-                FROM transactions
-                WHERE description = ?
-                LIMIT 1
+                FROM users
+                WHERE id = ?
                 """,
-                (f"Verified provider deposit {reference}",),
+                (user_id,),
             ).fetchone()
 
-            if duplicate:
+            if not user:
                 return jsonify({"success": True})
 
+            # Check the payment ledger first.
+            existing_payment = db.execute(
+                """
+                SELECT id, status
+                FROM payment_transactions
+                WHERE provider = 'paystack'
+                  AND provider_reference = ?
+                LIMIT 1
+                """,
+                (reference,),
+            ).fetchone()
+
+            if existing_payment and existing_payment["status"] == "success":
+                return jsonify({"success": True})
+
+            # Credit the wallet ledger exactly once.
+            ledger_tx = credit_wallet(
+                db,
+                user_id=user_id,
+                currency=currency,
+                amount=amount,
+                transaction_type="deposit",
+                description=f"Verified Paystack webhook deposit {reference}",
+                reference=ledger_reference,
+                idempotency_key=idempotency_key,
+            )
+
+            # Keep legacy balance synchronized during migration.
             db.execute(
                 """
                 UPDATE users
@@ -4702,6 +4733,58 @@ def paystack_webhook():
                 """,
                 (amount, user_id),
             )
+
+            if existing_payment:
+                db.execute(
+                    """
+                    UPDATE payment_transactions
+                    SET status = 'success',
+                        amount = ?,
+                        currency = ?,
+                        ledger_transaction_id = ?,
+                        metadata = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        amount,
+                        currency,
+                        ledger_tx["id"],
+                        json.dumps(verified),
+                        existing_payment["id"],
+                    ),
+                )
+            else:
+                db.execute(
+                    """
+                    INSERT INTO payment_transactions
+                    (
+                        user_id,
+                        provider,
+                        provider_reference,
+                        transaction_type,
+                        amount,
+                        currency,
+                        status,
+                        ledger_transaction_id,
+                        metadata,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (
+                        ?, 'paystack', ?, 'deposit', ?, ?, 'success',
+                        ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    )
+                    """,
+                    (
+                        user_id,
+                        reference,
+                        amount,
+                        currency,
+                        ledger_tx["id"],
+                        json.dumps(verified),
+                    ),
+                )
 
             db.execute(
                 """
@@ -4720,6 +4803,9 @@ def paystack_webhook():
         return jsonify({"success": True})
 
     except Exception:
+        # Payment providers expect a successful webhook response.
+        # The verification endpoint remains the authoritative
+        # recovery path if processing fails.
         return jsonify({"success": True})
 
 
