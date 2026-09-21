@@ -298,6 +298,13 @@ def init_db():
         add_column_if_missing(
             db,
             "users",
+            "phone",
+            "TEXT"
+        )
+
+        add_column_if_missing(
+            db,
+            "users",
             "avatar_url",
             "TEXT"
         )
