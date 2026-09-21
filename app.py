@@ -2195,7 +2195,7 @@ def ensure_profit_tables():
     try:
         db.execute("""
             CREATE TABLE IF NOT EXISTS platform_expenses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 type TEXT NOT NULL,
                 amount REAL NOT NULL,
                 currency TEXT NOT NULL DEFAULT 'NGN',
@@ -2206,7 +2206,7 @@ def ensure_profit_tables():
 
         db.execute("""
             CREATE TABLE IF NOT EXISTS revenue_sources (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
                 provider TEXT,
                 status TEXT NOT NULL DEFAULT 'active',
