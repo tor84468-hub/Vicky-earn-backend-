@@ -5172,3 +5172,210 @@ def admin_add_profit_expense():
         }), 201
     finally:
         db.close()
+
+# ============================================================
+# VICKY EARN — CUSTOMER FUNDING / DEDICATED BANK ACCOUNT
+# ============================================================
+
+def ensure_virtual_accounts_table(db):
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS virtual_accounts (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            provider TEXT NOT NULL,
+            account_number TEXT NOT NULL,
+            account_name TEXT,
+            bank_name TEXT,
+            provider_reference TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(provider, account_number),
+            UNIQUE(provider, user_id),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+
+
+@app.route("/api/payments/funding-account", methods=["GET"])
+def get_funding_account():
+    user_id = request.args.get("user_id", type=int)
+
+    if not user_id:
+        return jsonify({
+            "success": False,
+            "message": "User ID is required"
+        }), 400
+
+    db = get_db()
+
+    try:
+        ensure_virtual_accounts_table(db)
+
+        existing = db.execute("""
+            SELECT
+                provider,
+                account_number,
+                account_name,
+                bank_name,
+                status
+            FROM virtual_accounts
+            WHERE user_id = ?
+              AND status = 'active'
+            LIMIT 1
+        """, (user_id,)).fetchone()
+
+        if existing:
+            return jsonify({
+                "success": True,
+                "funding_account": dict(existing)
+            })
+
+        user = db.execute("""
+            SELECT id, name, email, phone
+            FROM users
+            WHERE id = ?
+        """, (user_id,)).fetchone()
+
+        if not user:
+            return jsonify({
+                "success": False,
+                "message": "User not found"
+            }), 404
+
+        secret_key = os.getenv("PAYSTACK_SECRET_KEY")
+
+        if not secret_key:
+            return jsonify({
+                "success": False,
+                "message": "Paystack funding is not configured"
+            }), 503
+
+        name_parts = (user["name"] or "Vicky User").strip().split()
+        first_name = name_parts[0] if name_parts else "Vicky"
+        last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else "User"
+
+        payload = {
+            "email": user["email"],
+            "first_name": first_name,
+            "last_name": last_name,
+            "country": "NG"
+        }
+
+        if user["phone"]:
+            payload["phone"] = user["phone"]
+
+        response = requests.post(
+            "https://api.paystack.co/dedicated_account/assign",
+            headers={
+                "Authorization": f"Bearer {secret_key}",
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=30
+        )
+
+        data = response.json()
+
+        if not response.ok or not data.get("status"):
+            return jsonify({
+                "success": False,
+                "message": data.get(
+                    "message",
+                    "Unable to create funding account"
+                )
+            }), 502
+
+        account = data.get("data") or {}
+
+        account_number = (
+            account.get("account_number")
+            or account.get("accountNumber")
+        )
+
+        account_name = (
+            account.get("account_name")
+            or account.get("accountName")
+        )
+
+        bank = account.get("bank")
+        bank_name = (
+            bank.get("name")
+            if isinstance(bank, dict)
+            else account.get("bank_name")
+        )
+
+        provider_reference = (
+            account.get("id")
+            or account.get("customer")
+            or account.get("customer_code")
+        )
+
+        if account_number:
+            db.execute("""
+                INSERT INTO virtual_accounts
+                (
+                    user_id,
+                    provider,
+                    account_number,
+                    account_name,
+                    bank_name,
+                    provider_reference,
+                    status,
+                    metadata,
+                    updated_at
+                )
+                VALUES (?, 'paystack', ?, ?, ?, ?, 'active', ?, CURRENT_TIMESTAMP)
+                ON CONFLICT (provider, user_id)
+                DO UPDATE SET
+                    account_number = EXCLUDED.account_number,
+                    account_name = EXCLUDED.account_name,
+                    bank_name = EXCLUDED.bank_name,
+                    provider_reference = EXCLUDED.provider_reference,
+                    status = 'active',
+                    metadata = EXCLUDED.metadata,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (
+                user_id,
+                account_number,
+                account_name,
+                bank_name,
+                str(provider_reference) if provider_reference else None,
+                json.dumps(account)
+            ))
+
+            db.commit()
+
+            return jsonify({
+                "success": True,
+                "status": "active",
+                "funding_account": {
+                    "provider": "paystack",
+                    "account_number": account_number,
+                    "account_name": account_name,
+                    "bank_name": bank_name,
+                    "status": "active"
+                }
+            })
+
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "status": "processing",
+            "message": data.get(
+                "message",
+                "Your Vicky Earn funding account is being created"
+            )
+        })
+
+    except Exception as e:
+        db.rollback()
+        return jsonify({
+            "success": False,
+            "message": str(e)
+        }), 500
+    finally:
+        db.close()
+
