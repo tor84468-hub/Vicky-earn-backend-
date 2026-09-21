@@ -503,6 +503,38 @@ def init_db():
         """)
 
         # ========================================================
+        # WITHDRAWAL LEDGER / PROVIDER TRACKING
+        # ========================================================
+
+        add_column_if_missing(
+            db,
+            "withdrawals",
+            "provider",
+            "TEXT"
+        )
+
+        add_column_if_missing(
+            db,
+            "withdrawals",
+            "provider_reference",
+            "TEXT"
+        )
+
+        add_column_if_missing(
+            db,
+            "withdrawals",
+            "ledger_transaction_id",
+            "BIGINT"
+        )
+
+        add_column_if_missing(
+            db,
+            "withdrawals",
+            "failure_reason",
+            "TEXT"
+        )
+
+        # ========================================================
         # REFERRALS
         # ========================================================
 

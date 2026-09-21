@@ -4383,9 +4383,7 @@ def production_withdraw():
     method = str(data.get("method", "bank")).lower()
     account_number = str(data.get("account_number", "")).strip()
     bank_code = str(data.get("bank_code", "")).strip()
-    beneficiary_name = str(
-        data.get("beneficiary_name", "")
-    ).strip()
+    beneficiary_name = str(data.get("beneficiary_name", "")).strip()
 
     if not user_id or not amount:
         return jsonify({
@@ -4413,55 +4411,95 @@ def production_withdraw():
             "message": "Amount must be greater than zero"
         }), 400
 
+    # Only currencies with a configured production payout path
+    # may reach the ledger debit.
+    if currency not in ("NGN", "XOF"):
+        return jsonify({
+            "success": False,
+            "message": "No production payout provider configured for this currency"
+        }), 400
+
     reference = new_reference("WDR")
-
-    with transaction() as db:
-        user = db.execute(
-            """
-            SELECT id, balance, currency
-            FROM users
-            WHERE id = ?
-            """,
-            (user_id,),
-        ).fetchone()
-
-        if not user:
-            return jsonify({
-                "success": False,
-                "message": "User not found"
-            }), 404
-
-        if Decimal(str(user["balance"])) < amount:
-            return jsonify({
-                "success": False,
-                "message": "Insufficient balance"
-            }), 400
-
-        db.execute(
-            """
-            UPDATE users
-            SET balance = balance - ?
-            WHERE id = ?
-            """,
-            (amount, user_id),
-        )
-
-        db.execute(
-            """
-            INSERT INTO withdrawals
-            (user_id, amount, currency, method, account, status, created_at)
-            VALUES (?, ?, ?, ?, ?, 'processing', CURRENT_TIMESTAMP)
-            """,
-            (
-                user_id,
-                amount,
-                currency,
-                method,
-                account_number,
-            ),
-        )
+    withdrawal_id = None
 
     try:
+        with transaction() as db:
+            user = db.execute(
+                """
+                SELECT id, balance, currency
+                FROM users
+                WHERE id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+
+            if not user:
+                return jsonify({
+                    "success": False,
+                    "message": "User not found"
+                }), 404
+
+            # Debit the real wallet ledger.
+            ledger_tx = debit_wallet(
+                db,
+                user_id=user_id,
+                currency=currency,
+                amount=amount,
+                transaction_type="withdrawal",
+                description=f"Withdrawal {reference}",
+                reference=reference,
+                idempotency_key=f"withdrawal-{reference}",
+            )
+
+            # Keep the legacy balance synchronized during migration.
+            legacy_update = db.execute(
+                """
+                UPDATE users
+                SET balance = balance - ?
+                WHERE id = ?
+                  AND balance >= ?
+                """,
+                (amount, user_id, amount),
+            )
+
+            if legacy_update.rowcount != 1:
+                raise ValueError(
+                    "Legacy balance is out of sync with wallet balance"
+                )
+
+            withdrawal = db.execute(
+                """
+                INSERT INTO withdrawals
+                (
+                    user_id,
+                    amount,
+                    currency,
+                    method,
+                    account,
+                    status,
+                    provider,
+                    provider_reference,
+                    ledger_transaction_id,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'processing', ?, ?, ?, CURRENT_TIMESTAMP)
+                RETURNING id
+                """,
+                (
+                    user_id,
+                    amount,
+                    currency,
+                    method,
+                    account_number,
+                    "paystack" if currency == "NGN" else "flutterwave",
+                    reference,
+                    ledger_tx["id"],
+                ),
+            ).fetchone()
+
+            withdrawal_id = withdrawal["id"]
+
+        # Provider payout happens after the wallet transaction commits.
         if currency == "NGN":
             recipient = paystack_create_recipient(
                 beneficiary_name,
@@ -4479,69 +4517,121 @@ def production_withdraw():
                 reference,
             )
 
+            if isinstance(transfer, dict) and transfer.get("status") is False:
+                raise ValueError(
+                    str(transfer.get("message") or "Paystack transfer failed")
+                )
+
+            provider_data = transfer.get("data") if isinstance(transfer, dict) else None
+            provider_reference = (
+                provider_data.get("reference")
+                if isinstance(provider_data, dict)
+                else None
+            ) or reference
+
+            with transaction() as db:
+                db.execute(
+                    """
+                    UPDATE withdrawals
+                    SET provider = 'paystack',
+                        provider_reference = ?,
+                        status = 'processing'
+                    WHERE id = ?
+                    """,
+                    (provider_reference, withdrawal_id),
+                )
+
             return jsonify({
                 "success": True,
                 "status": "processing",
                 "provider": "paystack",
                 "reference": reference,
-                "provider_response": transfer.get("data"),
+                "provider_response": provider_data,
             })
 
-        if currency == "GHS":
-            return jsonify({
-                "success": False,
-                "message": (
-                    "GHS payout requires a configured Flutterwave "
-                    "payout account."
-                )
-            }), 400
+        transfer = flutterwave_transfer(
+            data.get("bank_code", ""),
+            account_number,
+            float(amount),
+            currency,
+            reference,
+            beneficiary_name,
+        )
 
-        if currency == "XOF":
-            transfer = flutterwave_transfer(
-                data.get("bank_code", ""),
-                account_number,
-                float(amount),
-                currency,
-                reference,
-                beneficiary_name,
+        if isinstance(transfer, dict) and transfer.get("status") is False:
+            raise ValueError(
+                str(transfer.get("message") or "Flutterwave transfer failed")
             )
 
-            return jsonify({
-                "success": True,
-                "status": "processing",
-                "provider": "flutterwave",
-                "reference": reference,
-                "provider_response": transfer.get("data"),
-            })
+        provider_data = transfer.get("data") if isinstance(transfer, dict) else None
+        provider_reference = (
+            provider_data.get("reference")
+            if isinstance(provider_data, dict)
+            else None
+        ) or reference
 
-        return jsonify({
-            "success": False,
-            "message": "No production payout provider configured for this currency"
-        }), 400
-
-    except Exception as exc:
         with transaction() as db:
             db.execute(
                 """
-                UPDATE users
-                SET balance = balance + ?
+                UPDATE withdrawals
+                SET provider = 'flutterwave',
+                    provider_reference = ?,
+                    status = 'processing'
                 WHERE id = ?
                 """,
-                (amount, user_id),
+                (provider_reference, withdrawal_id),
             )
 
-            db.execute(
-                """
-                UPDATE withdrawals
-                SET status = 'failed'
-                WHERE user_id = ?
-                  AND status = 'processing'
-                  AND amount = ?
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (user_id, amount),
-            )
+        return jsonify({
+            "success": True,
+            "status": "processing",
+            "provider": "flutterwave",
+            "reference": reference,
+            "provider_response": provider_data,
+        })
+
+    except Exception as exc:
+        # Refund the wallet exactly once when payout initiation fails.
+        try:
+            with transaction() as db:
+                refund_tx = credit_wallet(
+                    db,
+                    user_id=user_id,
+                    currency=currency,
+                    amount=amount,
+                    transaction_type="withdrawal_refund",
+                    description=f"Refund failed withdrawal {reference}",
+                    reference=f"{reference}-REFUND",
+                    idempotency_key=f"{reference}-refund",
+                )
+
+                db.execute(
+                    """
+                    UPDATE users
+                    SET balance = balance + ?
+                    WHERE id = ?
+                    """,
+                    (amount, user_id),
+                )
+
+                if withdrawal_id:
+                    db.execute(
+                        """
+                        UPDATE withdrawals
+                        SET status = 'failed',
+                            failure_reason = ?,
+                            ledger_transaction_id = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            str(exc)[:1000],
+                            refund_tx["id"],
+                            withdrawal_id,
+                        ),
+                    )
+        except Exception:
+            # Keep the original provider failure visible.
+            pass
 
         return jsonify({
             "success": False,
