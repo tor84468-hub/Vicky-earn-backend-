@@ -394,6 +394,42 @@ def init_db():
         """)
 
         # ========================================================
+        # MIGRATE EXISTING USER BALANCES INTO WALLET ACCOUNTS
+        # ========================================================
+
+        users_with_balances = db.execute("""
+            SELECT id, currency, balance
+            FROM users
+            WHERE balance > 0
+        """).fetchall()
+
+        for user in users_with_balances:
+            wallet = db.execute("""
+                SELECT id
+                FROM wallet_accounts
+                WHERE user_id = ?
+                  AND currency = ?
+            """, (
+                user["id"],
+                str(user["currency"]).upper()
+            )).fetchone()
+
+            if not wallet:
+                db.execute("""
+                    INSERT INTO wallet_accounts
+                    (
+                        user_id,
+                        currency,
+                        available_balance
+                    )
+                    VALUES (?, ?, ?)
+                """, (
+                    user["id"],
+                    str(user["currency"]).upper(),
+                    user["balance"]
+                ))
+
+        # ========================================================
         # TRANSACTIONS
         # ========================================================
 
