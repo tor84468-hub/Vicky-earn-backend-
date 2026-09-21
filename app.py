@@ -398,6 +398,17 @@ def daily_bonus():
                     "message": "Daily bonus already claimed today"
                 }), 409
 
+            ledger_tx = credit_wallet(
+                db,
+                user_id=user_id,
+                currency=user["currency"],
+                amount=bonus,
+                transaction_type="daily_bonus",
+                description="Daily bonus",
+                reference=f"DAILY-BONUS-{user_id}-{bonus}",
+            )
+
+            # Keep legacy balance synchronized during migration.
             update = db.execute(
                 """
                 UPDATE users
@@ -408,7 +419,7 @@ def daily_bonus():
             )
 
             if update.rowcount != 1:
-                raise RuntimeError("Daily bonus balance update failed")
+                raise RuntimeError("Daily bonus legacy balance update failed")
 
             new_balance = db.execute(
                 "SELECT balance FROM users WHERE id = ?",
@@ -552,6 +563,17 @@ def complete_task():
                     "message": "Invalid task reward"
                 }), 400
 
+            ledger_tx = credit_wallet(
+                db,
+                user_id=user_id,
+                currency=user["currency"],
+                amount=reward,
+                transaction_type="task_reward",
+                description=description,
+                reference=f"TASK-{user_id}-{task['id']}",
+            )
+
+            # Keep legacy balance synchronized during migration.
             update = db.execute(
                 """
                 UPDATE users
@@ -562,7 +584,7 @@ def complete_task():
             )
 
             if update.rowcount != 1:
-                raise RuntimeError("Task balance update failed")
+                raise RuntimeError("Task legacy balance update failed")
 
             new_balance = db.execute(
                 "SELECT balance FROM users WHERE id = ?",
@@ -1069,8 +1091,49 @@ def transfer_money():
                 / FX_TO_USD[recipient_currency]
             )
 
-            # Atomic sender debit.
-            debit = db.execute(
+            transfer_reference = new_reference("TRF")
+
+            # Move both sides through the production wallet ledger.
+            # Both operations are inside the same database transaction,
+            # so a failure rolls the entire transfer back.
+            try:
+                debit_wallet(
+                    db,
+                    user_id=sender["id"],
+                    currency=sender_currency,
+                    amount=amount,
+                    transaction_type="transfer_sent",
+                    description=(
+                        f"Transfer to {recipient['name']} "
+                        f"({recipient['account_id']})"
+                    ),
+                    reference=f"{transfer_reference}-DEBIT",
+                    idempotency_key=f"{transfer_reference}-debit",
+                )
+
+                credit_wallet(
+                    db,
+                    user_id=recipient["id"],
+                    currency=recipient_currency,
+                    amount=received_amount,
+                    transaction_type="transfer_received",
+                    description=(
+                        f"Transfer from {sender['name']} "
+                        f"({sender['account_id']})"
+                    ),
+                    reference=f"{transfer_reference}-CREDIT",
+                    idempotency_key=f"{transfer_reference}-credit",
+                )
+            except ValueError as exc:
+                if "Insufficient balance" in str(exc):
+                    return jsonify({
+                        "success": False,
+                        "message": "Insufficient balance"
+                    }), 400
+                raise
+
+            # Keep legacy balances synchronized during migration.
+            sender_legacy = db.execute(
                 """
                 UPDATE users
                 SET balance = balance - ?
@@ -1080,14 +1143,12 @@ def transfer_money():
                 (amount, sender["id"], amount)
             )
 
-            if debit.rowcount != 1:
-                return jsonify({
-                    "success": False,
-                    "message": "Insufficient balance"
-                }), 400
+            if sender_legacy.rowcount != 1:
+                raise RuntimeError(
+                    "Sender legacy balance is out of sync with wallet balance"
+                )
 
-            # Recipient credit happens in the same transaction.
-            credit = db.execute(
+            recipient_legacy = db.execute(
                 """
                 UPDATE users
                 SET balance = balance + ?
@@ -1096,8 +1157,10 @@ def transfer_money():
                 (received_amount, recipient["id"])
             )
 
-            if credit.rowcount != 1:
-                raise RuntimeError("Recipient credit failed")
+            if recipient_legacy.rowcount != 1:
+                raise RuntimeError(
+                    "Recipient legacy balance update failed"
+                )
 
             sender_balance = db.execute(
                 "SELECT balance FROM users WHERE id = ?",
