@@ -303,6 +303,38 @@ def init_db():
         )
 
         # ========================================================
+        # VICKY EARN — CUSTOMER FUNDING ACCOUNTS
+        # ========================================================
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS virtual_accounts (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                provider TEXT NOT NULL,
+                account_number TEXT NOT NULL,
+                account_name TEXT,
+                bank_name TEXT,
+                provider_reference TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(provider, account_number),
+                UNIQUE(provider, user_id),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_virtual_accounts_user
+            ON virtual_accounts(user_id)
+        """)
+
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_virtual_accounts_account
+            ON virtual_accounts(provider, account_number)
+        """)
+
+        # ========================================================
         # PRODUCTION FINANCIAL LEDGER
         # ========================================================
 
