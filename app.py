@@ -776,22 +776,42 @@ def withdraw():
                     "message": "User not found"
                 }), 404
 
-            # Atomic balance deduction.
-            update = db.execute(
+            reference = new_reference("WDR")
+
+            try:
+                ledger_tx = debit_wallet(
+                    db,
+                    user_id=user_id,
+                    currency=user["currency"],
+                    amount=amount,
+                    transaction_type="withdrawal",
+                    description=f"Withdrawal via {method}",
+                    reference=reference,
+                    idempotency_key=f"wallet-withdrawal-{reference}",
+                )
+            except ValueError as exc:
+                if "Insufficient balance" in str(exc):
+                    return jsonify({
+                        "success": False,
+                        "message": "Insufficient balance"
+                    }), 400
+                raise
+
+            # Keep the legacy balance synchronized during migration.
+            legacy_update = db.execute(
                 """
                 UPDATE users
                 SET balance = balance - ?
                 WHERE id = ?
                   AND balance >= ?
                 """,
-                (amount, user_id, amount)
+                (amount, user_id, amount),
             )
 
-            if update.rowcount != 1:
-                return jsonify({
-                    "success": False,
-                    "message": "Insufficient balance"
-                }), 400
+            if legacy_update.rowcount != 1:
+                raise RuntimeError(
+                    "Legacy balance is out of sync with wallet balance"
+                )
 
             new_balance = db.execute(
                 "SELECT balance FROM users WHERE id = ?",
@@ -801,15 +821,27 @@ def withdraw():
             cursor = db.execute(
                 """
                 INSERT INTO withdrawals
-                (user_id, amount, currency, method, account, status)
-                VALUES (?, ?, ?, ?, ?, 'pending')
+                (
+                    user_id,
+                    amount,
+                    currency,
+                    method,
+                    account,
+                    status,
+                    provider,
+                    provider_reference,
+                    ledger_transaction_id
+                )
+                VALUES (?, ?, ?, ?, ?, 'pending', 'internal', ?, ?)
                 """,
                 (
                     user_id,
                     amount,
                     user["currency"],
                     method,
-                    account
+                    account,
+                    reference,
+                    ledger_tx["id"],
                 )
             )
 
