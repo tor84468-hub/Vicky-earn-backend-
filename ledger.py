@@ -54,6 +54,36 @@ def create_ledger_transaction(
     reference=None,
     idempotency_key=None,
 ):
+    # Return an existing transaction when the same reference or
+    # idempotency key has already been posted.
+    if reference:
+        existing = db.execute(
+            """
+            SELECT id, transaction_uuid
+            FROM ledger_transactions
+            WHERE reference = ?
+            LIMIT 1
+            """,
+            (reference,),
+        ).fetchone()
+
+        if existing:
+            return existing
+
+    if idempotency_key:
+        existing = db.execute(
+            """
+            SELECT id, transaction_uuid
+            FROM ledger_transactions
+            WHERE idempotency_key = ?
+            LIMIT 1
+            """,
+            (idempotency_key,),
+        ).fetchone()
+
+        if existing:
+            return existing
+
     transaction_uuid = secrets.token_hex(16)
 
     row = db.execute(
@@ -215,6 +245,36 @@ def credit_wallet(
 ):
     amount = _amount(amount)
     wallet = ensure_wallet(db, user_id, currency)
+
+    # A repeated provider reference/idempotency key must not
+    # create another wallet credit.
+    if reference or idempotency_key:
+        existing = None
+
+        if reference:
+            existing = db.execute(
+                """
+                SELECT id, transaction_uuid
+                FROM ledger_transactions
+                WHERE reference = ?
+                LIMIT 1
+                """,
+                (reference,),
+            ).fetchone()
+
+        if not existing and idempotency_key:
+            existing = db.execute(
+                """
+                SELECT id, transaction_uuid
+                FROM ledger_transactions
+                WHERE idempotency_key = ?
+                LIMIT 1
+                """,
+                (idempotency_key,),
+            ).fetchone()
+
+        if existing:
+            return existing
 
     tx = create_ledger_transaction(
         db,

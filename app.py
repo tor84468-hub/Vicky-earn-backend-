@@ -9,6 +9,7 @@ from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from database import init_db, get_db, transaction, generate_account_id
+from ledger import credit_wallet
 from vickycoin_config import vic_enabled, vic_get_balance, vic_get_transaction, vic_get_status
 
 from webauthn import (
@@ -4187,7 +4188,8 @@ def verify_production_deposit():
         user_id = metadata.get("user_id")
 
         if not user_id:
-            user_id = data.get("user_id")
+            data_user_id = data.get("user_id")
+            user_id = data_user_id
 
         if not user_id:
             return jsonify({
@@ -4198,23 +4200,32 @@ def verify_production_deposit():
         amount = Decimal(str(payment.get("amount", 0))) / Decimal("100")
         currency = str(payment.get("currency", "NGN")).upper()
 
+        if amount <= 0:
+            return jsonify({
+                "success": False,
+                "message": "Invalid payment amount"
+            }), 400
+
         with transaction() as db:
 
-            existing = db.execute(
+            payment_row = db.execute(
                 """
-                SELECT id
-                FROM transactions
-                WHERE description = ?
+                SELECT id, user_id, status, amount, currency, ledger_transaction_id
+                FROM payment_transactions
+                WHERE provider = 'paystack'
+                  AND provider_reference = ?
                 LIMIT 1
                 """,
-                (f"Provider deposit {reference}",),
+                (reference,),
             ).fetchone()
 
-            if existing:
+            # A successful provider reference is already settled.
+            if payment_row and str(payment_row["status"]).lower() == "success":
                 return jsonify({
                     "success": True,
                     "message": "Payment already credited",
                     "reference": reference,
+                    "status": "success"
                 })
 
             user = db.execute(
@@ -4232,6 +4243,67 @@ def verify_production_deposit():
                     "message": "User not found"
                 }), 404
 
+            # Create the provider transaction record if this reference
+            # did not exist before this verification.
+            if not payment_row:
+                db.execute(
+                    """
+                    INSERT INTO payment_transactions
+                    (
+                        user_id,
+                        provider,
+                        provider_reference,
+                        transaction_type,
+                        amount,
+                        currency,
+                        status,
+                        metadata
+                    )
+                    VALUES (
+                        ?, 'paystack', ?, 'deposit', ?, ?, 'pending', ?
+                    )
+                    """,
+                    (
+                        user_id,
+                        reference,
+                        amount,
+                        currency,
+                        json.dumps({
+                            "provider_status": payment.get("status"),
+                            "paystack_reference": reference
+                        }),
+                    ),
+                )
+
+            else:
+                if int(payment_row["user_id"]) != int(user_id):
+                    return jsonify({
+                        "success": False,
+                        "message": "Payment user mismatch"
+                    }), 409
+
+                if (
+                    Decimal(str(payment_row["amount"])) != amount
+                    or str(payment_row["currency"]).upper() != currency
+                ):
+                    return jsonify({
+                        "success": False,
+                        "message": "Payment amount or currency mismatch"
+                    }), 409
+
+            # Credit the new production wallet ledger.
+            ledger_tx = credit_wallet(
+                db,
+                user_id=user_id,
+                currency=currency,
+                amount=amount,
+                transaction_type="deposit",
+                description=f"Verified Paystack deposit {reference}",
+                reference=f"PAYSTACK-{reference}",
+                idempotency_key=f"paystack-deposit-{reference}",
+            )
+
+            # Keep the legacy balance synchronized during migration.
             db.execute(
                 """
                 UPDATE users
@@ -4244,8 +4316,17 @@ def verify_production_deposit():
             db.execute(
                 """
                 INSERT INTO transactions
-                (user_id, type, amount, currency, description, created_at)
-                VALUES (?, 'deposit', ?, ?, ?, CURRENT_TIMESTAMP)
+                (
+                    user_id,
+                    type,
+                    amount,
+                    currency,
+                    description,
+                    created_at
+                )
+                VALUES (
+                    ?, 'deposit', ?, ?, ?, CURRENT_TIMESTAMP
+                )
                 """,
                 (
                     user_id,
@@ -4255,12 +4336,35 @@ def verify_production_deposit():
                 ),
             )
 
+            db.execute(
+                """
+                UPDATE payment_transactions
+                SET status = 'success',
+                    ledger_transaction_id = ?,
+                    updated_at = CURRENT_TIMESTAMP,
+                    metadata = ?
+                WHERE provider = 'paystack'
+                  AND provider_reference = ?
+                """,
+                (
+                    ledger_tx["id"],
+                    json.dumps({
+                        "provider_status": payment.get("status"),
+                        "paystack_reference": reference,
+                        "credited_amount": str(amount),
+                        "currency": currency
+                    }),
+                    reference,
+                ),
+            )
+
         return jsonify({
             "success": True,
-            "message": "Deposit verified and credited",
+            "message": "Payment credited",
             "reference": reference,
+            "status": "success",
             "amount": float(amount),
-            "currency": currency,
+            "currency": currency
         })
 
     except Exception as exc:
@@ -4268,7 +4372,6 @@ def verify_production_deposit():
             "success": False,
             "message": str(exc)
         }), 502
-
 
 @app.route("/api/payments/withdraw", methods=["POST"])
 def production_withdraw():
