@@ -367,8 +367,13 @@ def daily_bonus():
         with transaction() as db:
             user = db.execute(
                 """
-                SELECT id, balance, currency
-                FROM users
+                SELECT u.id,
+                       COALESCE(w.available_balance, 0) AS balance,
+                       u.currency
+                FROM users u
+                LEFT JOIN wallet_accounts w
+                  ON w.user_id = u.id
+                 AND w.currency = UPPER(u.currency)
                 WHERE id = ?
                 """,
                 (user_id,)
@@ -422,8 +427,12 @@ def daily_bonus():
                 raise RuntimeError("Daily bonus legacy balance update failed")
 
             new_balance = db.execute(
-                "SELECT balance FROM users WHERE id = ?",
-                (user_id,)
+                """SELECT COALESCE(available_balance, 0) AS balance
+                   FROM wallet_accounts
+                   WHERE user_id = ?
+                     AND currency = ?
+                   """,
+                (user_id, currency)
             ).fetchone()["balance"]
 
             db.execute(
@@ -507,8 +516,13 @@ def complete_task():
         with transaction() as db:
             user = db.execute(
                 """
-                SELECT id, balance, currency
-                FROM users
+                SELECT u.id,
+                       COALESCE(w.available_balance, 0) AS balance,
+                       u.currency
+                FROM users u
+                LEFT JOIN wallet_accounts w
+                  ON w.user_id = u.id
+                 AND w.currency = UPPER(u.currency)
                 WHERE id = ?
                 """,
                 (user_id,)
@@ -587,7 +601,11 @@ def complete_task():
                 raise RuntimeError("Task legacy balance update failed")
 
             new_balance = db.execute(
-                "SELECT balance FROM users WHERE id = ?",
+                """SELECT COALESCE(available_balance, 0) AS balance
+                   FROM wallet_accounts
+                   WHERE user_id = ?
+                     AND currency = ?
+                   """,
                 (user_id,)
             ).fetchone()["balance"]
 
@@ -669,7 +687,13 @@ def update_currency():
     try:
         user = db.execute(
             """
-            SELECT id, name, email, balance, currency, avatar_url
+            SELECT u.id, u.name, u.email,
+                   COALESCE(w.available_balance, 0) AS balance,
+                   u.currency, u.avatar_url
+            FROM users u
+            LEFT JOIN wallet_accounts w
+              ON w.user_id = u.id
+             AND w.currency = UPPER(u.currency)
             FROM users
             WHERE id = ?
             """,
@@ -691,9 +715,14 @@ def update_currency():
 
         updated = db.execute(
             """
-            SELECT id, name, email, balance, currency
-            FROM users
-            WHERE id = ?
+            SELECT u.id, u.name, u.email,
+                   COALESCE(w.available_balance, 0) AS balance,
+                   u.currency
+            FROM users u
+            LEFT JOIN wallet_accounts w
+              ON w.user_id = u.id
+             AND w.currency = UPPER(u.currency)
+            WHERE u.id = ?
             """,
             (user_id,)
         ).fetchone()
@@ -719,9 +748,14 @@ def wallet(user_id):
     try:
         user = db.execute(
             """
-            SELECT id, name, email, account_id, balance, currency
-            FROM users
-            WHERE id = ?
+            SELECT u.id, u.name, u.email, u.account_id,
+                   COALESCE(w.available_balance, 0) AS balance,
+                   u.currency
+            FROM users u
+            LEFT JOIN wallet_accounts w
+              ON w.user_id = u.id
+             AND w.currency = UPPER(u.currency)
+            WHERE u.id = ?
             """,
             (user_id,)
         ).fetchone()
@@ -763,8 +797,13 @@ def withdraw():
         with transaction() as db:
             user = db.execute(
                 """
-                SELECT id, balance, currency
-                FROM users
+                SELECT u.id,
+                       COALESCE(w.available_balance, 0) AS balance,
+                       u.currency
+                FROM users u
+                LEFT JOIN wallet_accounts w
+                  ON w.user_id = u.id
+                 AND w.currency = UPPER(u.currency)
                 WHERE id = ?
                 """,
                 (user_id,)
@@ -814,7 +853,11 @@ def withdraw():
                 )
 
             new_balance = db.execute(
-                "SELECT balance FROM users WHERE id = ?",
+                """SELECT COALESCE(available_balance, 0) AS balance
+                   FROM wallet_accounts
+                   WHERE user_id = ?
+                     AND currency = ?
+                   """,
                 (user_id,)
             ).fetchone()["balance"]
 
@@ -964,8 +1007,13 @@ def transfer_quote():
     try:
         sender = db.execute(
             """
-            SELECT id, name, account_id, balance, currency
-            FROM users
+            SELECT u.id, u.name, u.account_id,
+                   COALESCE(w.available_balance, 0) AS balance,
+                   u.currency
+            FROM users u
+            LEFT JOIN wallet_accounts w
+              ON w.user_id = u.id
+             AND w.currency = UPPER(u.currency)
             WHERE account_id = ?
             """,
             (sender_account_id,)
@@ -1075,18 +1123,28 @@ def transfer_money():
         with transaction() as db:
             sender = db.execute(
                 """
-                SELECT id, name, email, account_id, balance, currency
-                FROM users
-                WHERE account_id = ?
+                SELECT u.id, u.name, u.email, u.account_id,
+                       COALESCE(w.available_balance, 0) AS balance,
+                       u.currency
+                FROM users u
+                LEFT JOIN wallet_accounts w
+                  ON w.user_id = u.id
+                 AND w.currency = UPPER(u.currency)
+                WHERE u.account_id = ?
                 """,
                 (sender_account_id,)
             ).fetchone()
 
             recipient = db.execute(
                 """
-                SELECT id, name, email, account_id, balance, currency
-                FROM users
-                WHERE account_id = ?
+                SELECT u.id, u.name, u.email, u.account_id,
+                       COALESCE(w.available_balance, 0) AS balance,
+                       u.currency
+                FROM users u
+                LEFT JOIN wallet_accounts w
+                  ON w.user_id = u.id
+                 AND w.currency = UPPER(u.currency)
+                WHERE u.account_id = ?
                 """,
                 (recipient_account_id,)
             ).fetchone()
@@ -1195,13 +1253,21 @@ def transfer_money():
                 )
 
             sender_balance = db.execute(
-                "SELECT balance FROM users WHERE id = ?",
-                (sender["id"],)
+                """SELECT COALESCE(available_balance, 0) AS balance
+                   FROM wallet_accounts
+                   WHERE user_id = ?
+                     AND currency = ?
+                   """,
+                (sender["id"], sender_currency)
             ).fetchone()["balance"]
 
             recipient_balance = db.execute(
-                "SELECT balance FROM users WHERE id = ?",
-                (recipient["id"],)
+                """SELECT COALESCE(available_balance, 0) AS balance
+                   FROM wallet_accounts
+                   WHERE user_id = ?
+                     AND currency = ?
+                   """,
+                (recipient["id"], recipient_currency)
             ).fetchone()["balance"]
 
             # Sender transaction.
@@ -1507,9 +1573,14 @@ def get_profile(user_id):
     try:
         user = db.execute(
             """
-            SELECT id, name, email, balance, currency, avatar_url, created_at
-            FROM users
-            WHERE id = ?
+            SELECT u.id, u.name, u.email,
+                   COALESCE(w.available_balance, 0) AS balance,
+                   u.currency, u.avatar_url, u.created_at
+            FROM users u
+            LEFT JOIN wallet_accounts w
+              ON w.user_id = u.id
+             AND w.currency = UPPER(u.currency)
+            WHERE u.id = ?
             """,
             (user_id,)
         ).fetchone()
@@ -1563,9 +1634,14 @@ def update_profile(user_id):
 
         updated = db.execute(
             """
-            SELECT id, name, email, balance, currency
-            FROM users
-            WHERE id = ?
+            SELECT u.id, u.name, u.email,
+                   COALESCE(w.available_balance, 0) AS balance,
+                   u.currency
+            FROM users u
+            LEFT JOIN wallet_accounts w
+              ON w.user_id = u.id
+             AND w.currency = UPPER(u.currency)
+            WHERE u.id = ?
             """,
             (user_id,)
         ).fetchone()
@@ -1893,8 +1969,9 @@ def admin_dashboard():
 
         total_balance = db.execute(
             """
-            SELECT COALESCE(SUM(balance), 0) AS total
-            FROM users
+            SELECT COALESCE(SUM(available_balance), 0) AS total
+            FROM wallet_accounts
+            WHERE status = 'active'
             """
         ).fetchone()["total"]
 
@@ -1907,10 +1984,14 @@ def admin_dashboard():
 
         users = db.execute(
             """
-            SELECT id, name, email, balance,
-                   currency, account_id, created_at
-            FROM users
-            ORDER BY id DESC
+            SELECT u.id, u.name, u.email,
+                   COALESCE(w.available_balance, 0) AS balance,
+                   u.currency, u.account_id, u.created_at
+            FROM users u
+            LEFT JOIN wallet_accounts w
+              ON w.user_id = u.id
+             AND w.currency = UPPER(u.currency)
+            ORDER BY u.id DESC
             LIMIT 100
             """
         ).fetchall()
@@ -1993,10 +2074,14 @@ def admin_users():
     try:
         rows = db.execute(
             """
-            SELECT id, name, email, balance,
-                   currency, account_id, created_at
-            FROM users
-            ORDER BY id DESC
+            SELECT u.id, u.name, u.email,
+                   COALESCE(w.available_balance, 0) AS balance,
+                   u.currency, u.account_id, u.created_at
+            FROM users u
+            LEFT JOIN wallet_accounts w
+              ON w.user_id = u.id
+             AND w.currency = UPPER(u.currency)
+            ORDER BY u.id DESC
             """
         ).fetchall()
     finally:
@@ -4137,9 +4222,14 @@ def payment_user(user_id):
     try:
         return db.execute(
             """
-            SELECT id, name, email, balance, currency, account_id
-            FROM users
-            WHERE id = ?
+            SELECT u.id, u.name, u.email,
+                   COALESCE(w.available_balance, 0) AS balance,
+                   u.currency, u.account_id
+            FROM users u
+            LEFT JOIN wallet_accounts w
+              ON w.user_id = u.id
+             AND w.currency = UPPER(u.currency)
+            WHERE u.id = ?
             """,
             (user_id,),
         ).fetchone()
@@ -4325,9 +4415,13 @@ def verify_production_deposit():
 
             user = db.execute(
                 """
-                SELECT id, balance
-                FROM users
-                WHERE id = ?
+                SELECT u.id,
+                       COALESCE(w.available_balance, 0) AS balance
+                FROM users u
+                LEFT JOIN wallet_accounts w
+                  ON w.user_id = u.id
+                 AND w.currency = UPPER(u.currency)
+                WHERE u.id = ?
                 """,
                 (user_id,),
             ).fetchone()
@@ -4521,9 +4615,14 @@ def production_withdraw():
         with transaction() as db:
             user = db.execute(
                 """
-                SELECT id, balance, currency
-                FROM users
-                WHERE id = ?
+                SELECT u.id,
+                       COALESCE(w.available_balance, 0) AS balance,
+                       u.currency
+                FROM users u
+                LEFT JOIN wallet_accounts w
+                  ON w.user_id = u.id
+                 AND w.currency = UPPER(u.currency)
+                WHERE u.id = ?
                 """,
                 (user_id,),
             ).fetchone()
